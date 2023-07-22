@@ -2,15 +2,13 @@ use std::{
     thread,
     sync::{mpsc, Arc, Mutex},
     thread::JoinHandle,
-    io::{prelude::*, BufReader},
-    net::{TcpListener, TcpStream},
 };
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
-struct ThreadPool {
-    workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+pub struct ThreadPool {
+    pub workers: Vec<Worker>,
+    pub sender: mpsc::Sender<Job>,
 }
 
 impl ThreadPool {
@@ -21,7 +19,7 @@ impl ThreadPool {
     /// # Panics
     ///
     /// The `new` function will panic if the size is zero.
-    fn new(size: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         assert!(size > 0);
 
         let (sender, receiver) = mpsc::channel();
@@ -35,7 +33,7 @@ impl ThreadPool {
         Self { workers, sender }
     }
 
-    fn execute<F>(&self, f: F)
+    pub fn execute<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static
     {
@@ -44,9 +42,9 @@ impl ThreadPool {
     }
 }
 
-struct Worker {
-    id: usize,
-    handle: JoinHandle<()>,
+pub struct Worker {
+    pub id: usize,
+    pub handle: JoinHandle<()>,
 }
 
 impl Worker {
@@ -57,26 +55,5 @@ impl Worker {
             job();
         });
         Self { id, handle }
-    }
-}
-
-fn main() {
-    let listner = TcpListener::bind("0.0.0.0:7878").unwrap();
-    let pool = ThreadPool::new(8);
-    for stream in listner.incoming() {
-        pool.execute(|| handle_connection(stream.unwrap()));
-    }
-}
-
-fn handle_connection(mut stream: TcpStream) {
-    let mut buf = [0; 1024];
-    loop {
-        let read = stream.read(&mut buf);
-        println!("got {:?}", &buf);
-        _ = match read {
-            Ok(n) if n == 0 => break,
-            Ok(n) => stream.write(&buf[0..n]).unwrap(),
-            Err(e) => { println!("{:?}", e); return; }
-        }
     }
 }
