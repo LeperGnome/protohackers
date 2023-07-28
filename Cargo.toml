@@ -9,4 +9,14 @@ path = "src/threadpool.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "smoke_test"
+path = "src/bin/smoke_test.rs"
+
+[[bin]]
+name = "prime_time"
+path = "src/bin/prime_time.rs"
+
 [dependencies]
+serde_json = "1.0.103"
+serde = { version = "1.0.174", features = ["derive"] }
