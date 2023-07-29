@@ -1,9 +1,8 @@
 use ::threadpool::ThreadPool;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use std::net::{TcpListener, TcpStream};
 use std::io::{prelude::*, BufReader, BufWriter};
-
+use std::net::{TcpListener, TcpStream};
 
 #[derive(Serialize, Deserialize, Debug)]
 enum Method {
@@ -15,7 +14,6 @@ struct Request {
     method: Method,
     number: serde_json::Number,
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Response {
@@ -41,15 +39,20 @@ fn handle_connection(stream: TcpStream) {
             let num_is_prime: bool;
             if let Some(num) = request.number.as_u64() {
                 num_is_prime = miller_rabin(num);
-            } else { 
+            } else {
                 num_is_prime = false;
             }
 
-            let response = Response{method: Method::isPrime, prime: num_is_prime};
+            let response = Response {
+                method: Method::isPrime,
+                prime: num_is_prime,
+            };
 
-            writer.write_all(format!("{}\n",serde_json::to_string(&response).unwrap()).as_bytes()).unwrap();
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&response).unwrap()).as_bytes())
+                .unwrap();
             writer.flush().unwrap();
-        } else { 
+        } else {
             println!("Request is not valid");
             writer.write_all(b"{}").unwrap();
             break;
@@ -58,10 +61,8 @@ fn handle_connection(stream: TcpStream) {
     println!("Closing stream...");
 }
 
-
 // NOTE: I took prime checking algorithm from "primal" rust library
 // https://github.com/huonw/primal/blob/master/primal-check/src/is_prime.rs
-
 
 fn mod_mul_(a: u64, b: u64, m: u64) -> u64 {
     (u128::from(a) * u128::from(b) % u128::from(m)) as u64
@@ -69,7 +70,13 @@ fn mod_mul_(a: u64, b: u64, m: u64) -> u64 {
 
 fn mod_mul(a: u64, b: u64, m: u64) -> u64 {
     match a.checked_mul(b) {
-        Some(r) => if r >= m { r % m } else { r },
+        Some(r) => {
+            if r >= m {
+                r % m
+            } else {
+                r
+            }
+        }
         None => mod_mul_(a, b, m),
     }
 }
@@ -122,30 +129,43 @@ pub fn miller_rabin(n: u64) -> bool {
         (std::u64::MAX, &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37]),
     ];
 
-    if n % 2 == 0 { return n == 2 }
-    if n == 1 { return false }
+    if n % 2 == 0 {
+        return n == 2;
+    }
+    if n == 1 {
+        return false;
+    }
 
     let mut d = n - 1;
     let mut s = 0;
-    while d % 2 == 0 { d /= 2; s += 1 }
+    while d % 2 == 0 {
+        d /= 2;
+        s += 1
+    }
 
-    let witnesses =
-        WITNESSES.iter().find(|&&(hi, _)| hi >= n)
-            .map(|&(_, wtnss)| wtnss).unwrap();
+    let witnesses = WITNESSES
+        .iter()
+        .find(|&&(hi, _)| hi >= n)
+        .map(|&(_, wtnss)| wtnss)
+        .unwrap();
     'next_witness: for &a in witnesses.iter() {
         let mut power = mod_exp(a, d, n);
         assert!(power < n);
-        if power == 1 || power == n - 1 { continue 'next_witness }
+        if power == 1 || power == n - 1 {
+            continue 'next_witness;
+        }
 
         for _r in 0..s {
             power = mod_sqr(power, n);
             assert!(power < n);
-            if power == 1 { return false }
+            if power == 1 {
+                return false;
+            }
             if power == n - 1 {
-                continue 'next_witness
+                continue 'next_witness;
             }
         }
-        return false
+        return false;
     }
 
     true

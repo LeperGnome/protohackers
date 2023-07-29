@@ -1,7 +1,7 @@
 use ::threadpool::ThreadPool;
 
-use std::net::{TcpListener, TcpStream};
 use std::io::prelude::*;
+use std::net::{TcpListener, TcpStream};
 
 fn main() {
     let listner = TcpListener::bind("0.0.0.0:7878").unwrap();
@@ -21,21 +21,24 @@ fn handle_connection(mut stream: TcpStream) {
         };
 
         let message_type = message[0] as char;
-        let num1 = i32::from_be_bytes(<[u8;4]>::try_from(&message[1..5]).unwrap());
-        let num2 = i32::from_be_bytes(<[u8;4]>::try_from(&message[5..]).unwrap());
+        let num1 = i32::from_be_bytes(<[u8; 4]>::try_from(&message[1..5]).unwrap());
+        let num2 = i32::from_be_bytes(<[u8; 4]>::try_from(&message[5..]).unwrap());
 
         match message_type {
             'I' => {
-                match insert_data(&mut prices, num1, num2){
+                match insert_data(&mut prices, num1, num2) {
                     Ok(_) => (),
                     Err(_) => break,
                 };
-            },
-            'Q' => { 
+            }
+            'Q' => {
                 let res = query_data(&prices, num1, num2);
                 stream.write_all(&res.to_be_bytes()).unwrap();
-            },
-            _ => { println!("unknown command, closing connection"); break; },
+            }
+            _ => {
+                println!("unknown command, closing connection");
+                break;
+            }
         }
         // println!("Current prices: {:?}", &prices);
     }
@@ -58,9 +61,13 @@ fn query_data(prices: &Vec<[i32; 2]>, date_from: i32, date_to: i32) -> i32 {
     }
 
     let mut count = 0_i64;
-    let sum: i64 = prices.iter()
+    let sum: i64 = prices
+        .iter()
         .filter(|x| x[0] >= date_from && x[0] <= date_to)
-        .map(|x| { count += 1; return x[1] as i64; })
+        .map(|x| {
+            count += 1;
+            return x[1] as i64;
+        })
         .sum();
 
     if count == 0 {

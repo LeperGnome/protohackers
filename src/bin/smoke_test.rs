@@ -21,7 +21,10 @@ fn handle_connection(mut stream: TcpStream) {
         _ = match read {
             Ok(n) if n == 0 => break,
             Ok(n) => stream.write(&buf[0..n]).unwrap(),
-            Err(e) => { println!("{:?}", e); return; }
+            Err(e) => {
+                println!("{:?}", e);
+                return;
+            }
         }
     }
 }
