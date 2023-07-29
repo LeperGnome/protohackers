@@ -17,6 +17,15 @@ path = "src/bin/smoke_test.rs"
 name = "prime_time"
 path = "src/bin/prime_time.rs"
 
+[[bin]]
+name = "means_to_an_end"
+path = "src/bin/means_to_an_end.rs"
+
+[[bin]]
+name = "budget_chat"
+path = "src/bin/budget_chat.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
+tokio = { version = "1.29.1", features = ["full"] }
