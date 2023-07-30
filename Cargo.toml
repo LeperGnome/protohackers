@@ -25,6 +25,10 @@ path = "src/bin/means_to_an_end.rs"
 name = "budget_chat"
 path = "src/bin/budget_chat.rs"
 
+[[bin]]
+name = "unusual_db"
+path = "src/bin/unusual_db.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
