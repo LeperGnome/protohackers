@@ -33,6 +33,10 @@ path = "src/bin/unusual_db.rs"
 name = "mob_in_the_middle"
 path = "src/bin/mob_in_the_middle.rs"
 
+[[bin]]
+name = "speed_deamon"
+path = "src/bin/speed_deamon.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
