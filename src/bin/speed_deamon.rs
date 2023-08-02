@@ -1,11 +1,23 @@
 use tokio::{
-    io::{AsyncReadExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, TcpListener}
 };
 
 struct SrtMsg {
     len: u8,
-    data: [u8],
+    content: Vec<u8>,
+}
+
+impl SrtMsg {
+    async fn read(stream: &mut TcpStream) -> Self {
+        let len = stream.read_u8().await.unwrap();
+        let mut content: Vec<u8> = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            let el = stream.read_u8().await.unwrap();
+            content.push(el);
+        }
+        return Self { len, content };
+    }
 }
 
 const ERROR_CODE: u8 = 0x10;
@@ -48,7 +60,19 @@ struct IAmCameraMsg {
 const I_AM_DISPATCHER_CODE: u8 = 0x81;
 struct IAmDispatcherMsg {
     numroads: u8,
-    roads: [u16],
+    roads: Vec<u16>,
+}
+
+impl IAmDispatcherMsg {
+    async fn read(stream: &mut TcpStream) -> Self {
+        let numroads = stream.read_u8().await.unwrap();
+        let mut roads: Vec<u16> = Vec::with_capacity(numroads as usize);
+        for _ in 0..numroads {
+            let road = stream.read_u16().await.unwrap();
+            roads.push(road);
+        }
+        return Self { numroads, roads };
+    }
 }
 
 #[tokio::main]
@@ -71,15 +95,21 @@ async fn handle_stream(mut stream: TcpStream) {
     match stream.read_u8().await.unwrap() {
         I_AM_DISPATCHER_CODE => handle_dispatcher_conn(stream).await,
         I_AM_CAMERA_CODE => handle_camera_conn(stream).await,
-        _ => todo!(),
+        _ => stream.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
     };
 
 }
 
 async fn handle_dispatcher_conn(mut stream: TcpStream) {
-    println!("Processing dispatcher connection...")
+    println!("Processing dispatcher connection...");
+    let dispatcher_data = IAmDispatcherMsg::read(&mut stream).await;
+    // TODO:
+    // save dispatcher data to shared state
+    // receive and write tickets
 }
 
 async fn handle_camera_conn(mut stream: TcpStream) {
     println!("Processing camera connection...")
+    // TODO:
+    // send tickets to shared state
 }
