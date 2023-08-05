@@ -1,6 +1,7 @@
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, TcpListener}
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
 
 struct SrtMsg {
@@ -31,6 +32,14 @@ struct PlateMsg {
     plate: SrtMsg,
 }
 
+impl PlateMsg {
+    async fn read(stream: &mut TcpStream) -> Self {
+        let timestamp = stream.read_u32().await.unwrap();
+        let plate = SrtMsg::read(stream).await;
+        return Self { timestamp, plate };
+    }
+}
+
 const TICKET_CODE: u8 = 0x21;
 struct TicketMsg {
     road: u16,
@@ -56,6 +65,14 @@ struct IAmCameraMsg {
     mile: u16,
     limit: u16,
 }
+impl IAmCameraMsg {
+    async fn read(stream: &mut TcpStream) -> Self {
+        let road = stream.read_u16().await.unwrap();
+        let mile = stream.read_u16().await.unwrap();
+        let limit = stream.read_u16().await.unwrap();
+        return Self { road, mile, limit };
+    }
+}
 
 const I_AM_DISPATCHER_CODE: u8 = 0x81;
 struct IAmDispatcherMsg {
@@ -75,29 +92,56 @@ impl IAmDispatcherMsg {
     }
 }
 
+#[derive(Debug)]
+struct Snapshot {}
+
+struct SpeedDaemon {
+    snapshots: Vec<Snapshot>,
+    snapshots_rx: mpsc::Receiver<Snapshot>,
+}
+
+impl SpeedDaemon {
+    fn new(rx: mpsc::Receiver<Snapshot>) -> Self {
+        return Self {
+            snapshots: vec![],
+            snapshots_rx: rx,
+        };
+    }
+
+    async fn process(&mut self) {
+        while let Some(_) = self.snapshots_rx.recv().await {
+            println!("Got snapshot!");
+            // TODO organise data in some way and store
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    let (tx, rx) = mpsc::channel::<Snapshot>(1024);
+    tokio::spawn(async move {
+        let mut daemon = SpeedDaemon::new(rx);
+        daemon.process().await;
+    });
+
     let listner = TcpListener::bind("0.0.0.0:7878").await.unwrap();
     loop {
+        let tx = tx.clone();
         match listner.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(async move {
-                    handle_stream(stream).await
-                });
+                tokio::spawn(async move { handle_stream(stream, tx).await });
             }
-            Err(e) => println!("Failed accepting connection: {:?}", e)
+            Err(e) => println!("Failed accepting connection: {:?}", e),
         };
     }
 }
 
-
-async fn handle_stream(mut stream: TcpStream) {
+async fn handle_stream(mut stream: TcpStream, snapshot_tx: mpsc::Sender<Snapshot>) {
     match stream.read_u8().await.unwrap() {
         I_AM_DISPATCHER_CODE => handle_dispatcher_conn(stream).await,
-        I_AM_CAMERA_CODE => handle_camera_conn(stream).await,
+        I_AM_CAMERA_CODE => handle_camera_conn(stream, snapshot_tx).await,
         _ => stream.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
     };
-
 }
 
 async fn handle_dispatcher_conn(mut stream: TcpStream) {
@@ -108,8 +152,19 @@ async fn handle_dispatcher_conn(mut stream: TcpStream) {
     // receive and write tickets
 }
 
-async fn handle_camera_conn(mut stream: TcpStream) {
-    println!("Processing camera connection...")
-    // TODO:
-    // send tickets to shared state
+async fn handle_camera_conn(mut stream: TcpStream, snapshot_tx: mpsc::Sender<Snapshot>) {
+    println!("Processing camera connection...");
+
+    let camera_info = IAmCameraMsg::read(&mut stream).await;
+    loop {
+        match stream.read_u8().await.unwrap() {
+            PLATE_CODE => {
+                let plate_msg = PlateMsg::read(&mut stream).await;
+                // TODO
+                snapshot_tx.send(Snapshot {}).await.unwrap();
+            }
+            WANT_HEART_BEAT_CODE => (),
+            _ => stream.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+        }
+    }
 }
