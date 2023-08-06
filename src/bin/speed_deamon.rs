@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, Mutex as AMutex},
 };
 
 #[derive(Debug, Clone)]
@@ -181,34 +181,39 @@ async fn handle_stream(
     snapshot_tx: mpsc::Sender<Snapshot>,
     dispatcher_tx: mpsc::Sender<DispatcherRegistration>,
 ) {
-    let (mut r, mut w) = split(stream);
+    let (mut r, w) = split(stream);
+    let wa = Arc::new(AMutex::new(w));
     match r.read_u8().await.unwrap() {
         WANT_HEART_BEAT_CODE => {
             let heartbeat = WantHeartbeatMsg::read(&mut r).await;
+            let wa2 = wa.clone();
             tokio::spawn(async move {
-                spawn_heartbeat(&mut w, heartbeat.interval as f32).await;
+                spawn_heartbeat(wa2, heartbeat.interval as f32).await;
             });
             match r.read_u8().await.unwrap() {
-                I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, &mut w, dispatcher_tx).await,
-                I_AM_CAMERA_CODE => handle_camera_conn(&mut r, &mut w, snapshot_tx).await,
-                _ => w.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+                I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+                I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+                _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
             }
         }
-        I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, &mut w, dispatcher_tx).await,
-        I_AM_CAMERA_CODE => handle_camera_conn(&mut r, &mut w, snapshot_tx).await,
-        _ => w.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+        I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+        I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+        _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
     };
 }
 
-async fn spawn_heartbeat<W: AsyncWrite + Unpin + Send>(w: &mut W, interval: f32) {
-    while let Ok(_) = w.write_all(&[HEART_BEAT_CODE]).await {
+async fn spawn_heartbeat<W>(w: Arc<AMutex<W>>, interval: f32)
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
         tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32));
     }
 }
 
 async fn handle_dispatcher_conn<R, W>(
     r: &mut R,
-    w: &mut W,
+    w: Arc<AMutex<W>>,
     dispatcher_tx: mpsc::Sender<DispatcherRegistration>,
 ) where
     R: AsyncRead + Unpin + Send,
@@ -236,7 +241,7 @@ async fn handle_dispatcher_conn<R, W>(
     // TODO: handle heartbeat at any point?
 }
 
-async fn handle_camera_conn<R, W>(r: &mut R, w: &mut W, snapshot_tx: mpsc::Sender<Snapshot>)
+async fn handle_camera_conn<R, W>(r: &mut R, w: Arc<AMutex<W>>, snapshot_tx: mpsc::Sender<Snapshot>)
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
@@ -259,7 +264,7 @@ where
             }
             // TODO: handle heartbeat at any point?
             WANT_HEART_BEAT_CODE => (),
-            _ => w.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+            _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
         }
     }
 }
