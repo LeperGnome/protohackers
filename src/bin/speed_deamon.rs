@@ -17,9 +17,10 @@ impl SrtMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
         let len = stream.read_u8().await.unwrap();
         let mut content: Vec<u8> = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            let el = stream.read_u8().await.unwrap();
-            content.push(el);
+        for i in 0..len {
+            let c = stream.read_u8().await.unwrap();
+            println!("{i}, {:?}", char::from_u32(c as u32));
+            content.push(c);
         }
         return Self { len, content };
     }
@@ -183,21 +184,25 @@ async fn handle_stream(
 ) {
     let (mut r, w) = split(stream);
     let wa = Arc::new(AMutex::new(w));
-    match r.read_u8().await.unwrap() {
-        WANT_HEART_BEAT_CODE => {
-            let heartbeat = WantHeartbeatMsg::read(&mut r).await;
+    match r.read_u8().await {
+        Ok(b) if b == WANT_HEART_BEAT_CODE => {
             let wa2 = wa.clone();
-            tokio::spawn(async move {
-                spawn_heartbeat(wa2, heartbeat.interval as f32).await;
-            });
-            match r.read_u8().await.unwrap() {
-                I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
-                I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+            let heartbeat = WantHeartbeatMsg::read(&mut r).await;
+            if heartbeat.interval > 0 {
+                tokio::spawn(async move {
+                    spawn_heartbeat(wa2, heartbeat.interval as f32).await;
+                });
+            }
+            match r.read_u8().await {
+                Ok(b) if b == I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+                Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+                Err(_) => return,
                 _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
             }
         }
-        I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
-        I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+        Ok(b) if b == I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+        Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+        Err(_) => return,
         _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
     };
 }
@@ -207,8 +212,10 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
-        tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32));
+        println!("Sent heartbeat");
+        tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
     }
+    println!("Client disconnected, stopping heartbeat");
 }
 
 async fn handle_dispatcher_conn<R, W>(
@@ -250,8 +257,8 @@ where
 
     let camera_info = IAmCameraMsg::read(r).await;
     loop {
-        match r.read_u8().await.unwrap() {
-            PLATE_CODE => {
+        match r.read_u8().await {
+            Ok(b) if b == PLATE_CODE => {
                 let plate_msg = PlateMsg::read(r).await;
                 // TODO
                 snapshot_tx
@@ -263,8 +270,11 @@ where
                     .unwrap();
             }
             // TODO: handle heartbeat at any point?
-            WANT_HEART_BEAT_CODE => (),
+            Ok(b) if b == WANT_HEART_BEAT_CODE => (),
+            Err(_) => break,
             _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+
         }
     }
+    println!("Closing camera connection");
 }
