@@ -17,11 +17,10 @@ impl SrtMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
         let len = stream.read_u8().await.unwrap();
         let mut content: Vec<u8> = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let c = stream.read_u8().await.unwrap();
-            println!("{i}, {:?}", char::from_u32(c as u32));
-            content.push(c);
+        for _ in 0..len {
+            content.push(0);
         }
+        stream.read_exact(&mut content).await.unwrap();
         return Self { len, content };
     }
 }
@@ -34,14 +33,14 @@ struct ServerErrorMsg {
 const PLATE_CODE: u8 = 0x20;
 #[derive(Debug, Clone)]
 struct PlateMsg {
-    timestamp: u32,
     plate: SrtMsg,
+    timestamp: u32,
 }
 
 impl PlateMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
-        let timestamp = stream.read_u32().await.unwrap();
         let plate = SrtMsg::read(stream).await;
+        let timestamp = stream.read_u32().await.unwrap();
         return Self { timestamp, plate };
     }
 }
@@ -113,14 +112,24 @@ struct Snapshot {
     plate: PlateMsg,
 }
 
+// {
+//     "NSDF": {
+//          123 : [
+//              (t, m), ...
+//          ]
+//     }
+// }
+
 struct State {
     snapshots: Vec<Snapshot>,
+    idle_tickets: HashMap<u16, Vec<TicketMsg>>,
     dispatchrs: HashMap<u16, Vec<mpsc::Sender<TicketMsg>>>,
 }
 impl State {
     fn new() -> Self {
         Self {
             snapshots: vec![],
+            idle_tickets: HashMap::new(),
             dispatchrs: HashMap::new(),
         }
     }
@@ -135,7 +144,6 @@ struct DispatcherRegistration {
 async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<Mutex<State>>) {
     while let Some(s) = rx.recv().await {
         println!("Got snapshot: {:?}", s);
-        // TODO organise data in some way and store
     }
 }
 
@@ -145,7 +153,15 @@ async fn process_dispatchers(
 ) {
     while let Some(d) = rx.recv().await {
         println!("New dispatcher: {:?}", d.info);
-        // TODO organise data in some way and store
+        for road in d.info.roads {
+            state
+                .lock()
+                .unwrap()
+                .dispatchrs
+                .entry(road)
+                .or_insert(Vec::new())
+                .push(d.tx.clone());
+        }
     }
 }
 
@@ -186,36 +202,49 @@ async fn handle_stream(
     let wa = Arc::new(AMutex::new(w));
     match r.read_u8().await {
         Ok(b) if b == WANT_HEART_BEAT_CODE => {
-            let wa2 = wa.clone();
-            let heartbeat = WantHeartbeatMsg::read(&mut r).await;
-            if heartbeat.interval > 0 {
-                tokio::spawn(async move {
-                    spawn_heartbeat(wa2, heartbeat.interval as f32).await;
-                });
-            }
+            let hb = WantHeartbeatMsg::read(&mut r).await;
+            spawn_heartbeat(wa.clone(), hb.interval as f32);
             match r.read_u8().await {
-                Ok(b) if b == I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+                Ok(b) if b == I_AM_DISPATCHER_CODE => {
+                    handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await
+                }
                 Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
                 Err(_) => return,
-                _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+                _ => wa
+                    .lock()
+                    .await
+                    .write_all(&[ERROR_CODE, 0x00])
+                    .await
+                    .unwrap(),
             }
         }
-        Ok(b) if b == I_AM_DISPATCHER_CODE => handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await,
+        Ok(b) if b == I_AM_DISPATCHER_CODE => {
+            handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await
+        }
         Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
         Err(_) => return,
-        _ => wa.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+        _ => wa
+            .lock()
+            .await
+            .write_all(&[ERROR_CODE, 0x00])
+            .await
+            .unwrap(),
     };
 }
 
-async fn spawn_heartbeat<W>(w: Arc<AMutex<W>>, interval: f32)
+fn spawn_heartbeat<W>(w: Arc<AMutex<W>>, interval: f32)
 where
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
-    while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
-        println!("Sent heartbeat");
-        tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
+    if interval > 0_f32 {
+        tokio::spawn(async move {
+            while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
+                println!("Sent heartbeat");
+                tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
+            }
+            println!("Client disconnected, stopping heartbeat");
+        });
     }
-    println!("Client disconnected, stopping heartbeat");
 }
 
 async fn handle_dispatcher_conn<R, W>(
@@ -256,6 +285,7 @@ where
     println!("Processing camera connection...");
 
     let camera_info = IAmCameraMsg::read(r).await;
+    println!("Got camera: {:?}", &camera_info);
     loop {
         match r.read_u8().await {
             Ok(b) if b == PLATE_CODE => {
@@ -271,9 +301,11 @@ where
             }
             // TODO: handle heartbeat at any point?
             Ok(b) if b == WANT_HEART_BEAT_CODE => (),
-            Err(_) => break,
+            Err(e) => {
+                eprintln!("got error from camera: {e}");
+                break;
+            }
             _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
-
         }
     }
     println!("Closing camera connection");
