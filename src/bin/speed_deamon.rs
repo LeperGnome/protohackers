@@ -12,7 +12,6 @@ struct SrtMsg {
     len: u8,
     content: Vec<u8>,
 }
-
 impl SrtMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
         let len = stream.read_u8().await.unwrap();
@@ -36,7 +35,6 @@ struct PlateMsg {
     plate: SrtMsg,
     timestamp: u32,
 }
-
 impl PlateMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
         let plate = SrtMsg::read(stream).await;
@@ -93,7 +91,6 @@ struct IAmDispatcherMsg {
     numroads: u8,
     roads: Vec<u16>,
 }
-
 impl IAmDispatcherMsg {
     async fn read<R: AsyncRead + Unpin + Send>(stream: &mut R) -> Self {
         let numroads = stream.read_u8().await.unwrap();
