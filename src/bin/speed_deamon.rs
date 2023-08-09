@@ -25,9 +25,6 @@ impl SrtMsg {
 }
 
 const ERROR_CODE: u8 = 0x10;
-struct ServerErrorMsg {
-    msg: SrtMsg,
-}
 
 const PLATE_CODE: u8 = 0x20;
 #[derive(Debug, Clone)]
@@ -54,6 +51,39 @@ struct TicketMsg {
     speed: u16, // 100x mph
     plate: SrtMsg,
 }
+impl TicketMsg {
+    fn from_snapshots(s1: &Snapshot, s2: &Snapshot) -> Self {
+        let road = s1.from.road;
+        let plate = s2.plate.clone();
+        let timestamp1 = s1.plate.timestamp.min(s2.plate.timestamp);
+        let timestamp2 = s1.plate.timestamp.max(s2.plate.timestamp);
+        let mile1 = s1.from.mile.min(s2.from.mile);
+        let mile2 = s1.from.mile.max(s2.from.mile);
+        let speed =
+            (((mile2 - mile1) as f32) * 10000_f32) / (((timestamp2 - timestamp1) as f32) / 36_f32); // TODO rounding
+        Self {
+            road,
+            mile1,
+            mile2,
+            timestamp1,
+            timestamp2,
+            speed: speed as u16,
+            plate: plate.plate,
+        }
+    }
+    async fn drain<W: AsyncWrite + Unpin + Send>(&self, w: Arc<AMutex<W>>) {
+        let mut wl = w.lock().await;
+        wl.write_u8(TICKET_CODE).await.unwrap();
+        wl.write_u8(self.plate.len).await.unwrap();
+        wl.write_all(&self.plate.content).await.unwrap();
+        wl.write_u16(self.road).await.unwrap();
+        wl.write_u16(self.mile1).await.unwrap();
+        wl.write_u32(self.timestamp1).await.unwrap();
+        wl.write_u16(self.mile2).await.unwrap();
+        wl.write_u32(self.timestamp2).await.unwrap();
+        wl.write_u16(self.speed).await.unwrap();
+    }
+}
 
 const WANT_HEART_BEAT_CODE: u8 = 0x40;
 struct WantHeartbeatMsg {
@@ -67,7 +97,6 @@ impl WantHeartbeatMsg {
 }
 
 const HEART_BEAT_CODE: u8 = 0x41;
-struct HeartbeatMsg {}
 
 const I_AM_CAMERA_CODE: u8 = 0x80;
 #[derive(Debug, Clone, Copy)]
@@ -88,7 +117,6 @@ impl IAmCameraMsg {
 const I_AM_DISPATCHER_CODE: u8 = 0x81;
 #[derive(Debug)]
 struct IAmDispatcherMsg {
-    numroads: u8,
     roads: Vec<u16>,
 }
 impl IAmDispatcherMsg {
@@ -99,7 +127,7 @@ impl IAmDispatcherMsg {
             let road = stream.read_u16().await.unwrap();
             roads.push(road);
         }
-        return Self { numroads, roads };
+        return Self { roads };
     }
 }
 
@@ -108,14 +136,6 @@ struct Snapshot {
     from: IAmCameraMsg,
     plate: PlateMsg,
 }
-
-// {
-//     "NSDF": {
-//          123 : [
-//              (t, m), ...
-//          ]
-//     }
-// }
 
 struct State {
     snapshots: Vec<Snapshot>,
@@ -167,28 +187,15 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
                     && cur_idx.abs_diff(*i) == 1
             })
             .for_each(|(_, x)| {
-                let road = x.from.road;
-                let plate = new_snap.plate.clone();
-                let timestamp1 = new_snap.plate.timestamp.min(x.plate.timestamp);
-                let timestamp2 = new_snap.plate.timestamp.max(x.plate.timestamp);
-                let mile1 = new_snap.from.mile.min(x.from.mile);
-                let mile2 = new_snap.from.mile.max(x.from.mile);
-                let speed = (((mile2 - mile1) as f32) * 10000_f32) / (((timestamp2 - timestamp1) as f32) / 36_f32); // TODO rounding
-                let ticket = TicketMsg {
-                        road,
-                        mile1,
-                        mile2,
-                        timestamp1,
-                        timestamp2,
-                        speed: speed as u16,
-                        plate: plate.plate,
-                    };
-                println!("possible ticket: {:?}", &ticket);
+                let ticket = TicketMsg::from_snapshots(x, &new_snap);
+                println!("Possible ticket: {:?}", &ticket);
 
                 if ticket.speed > x.from.limit.saturating_mul(100) {
                     tickets.push(ticket);
                 }
             });
+        // TODO: removing snapshots?
+        // TODO: 1 ticket per car per day
 
         for ticket in tickets {
             if let Some(ds) = st.dispatchrs.get(&ticket.road) {
@@ -334,16 +341,7 @@ async fn handle_dispatcher_conn<R, W>(
     // gettings tickets to send to client
     while let Some(t) = ticket_rx.recv().await {
         println!("Got ticket: {:?}", t);
-        let mut wl = w.lock().await;
-        wl.write_u8(TICKET_CODE).await.unwrap();
-        wl.write_u8(t.plate.len).await.unwrap();
-        wl.write_all(&t.plate.content).await.unwrap();
-        wl.write_u16(t.road).await.unwrap();
-        wl.write_u16(t.mile1).await.unwrap();
-        wl.write_u32(t.timestamp1).await.unwrap();
-        wl.write_u16(t.mile2).await.unwrap();
-        wl.write_u32(t.timestamp2).await.unwrap();
-        wl.write_u16(t.speed).await.unwrap();
+        t.drain(w.clone()).await;
     }
     // TODO: handle heartbeat at any point?
     // TODO: handle disconnect
