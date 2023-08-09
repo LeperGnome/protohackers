@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -44,7 +44,7 @@ impl PlateMsg {
 }
 
 const TICKET_CODE: u8 = 0x21;
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TicketMsg {
     road: u16,
     mile1: u16,
@@ -103,7 +103,7 @@ impl IAmDispatcherMsg {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Snapshot {
     from: IAmCameraMsg,
     plate: PlateMsg,
@@ -119,14 +119,14 @@ struct Snapshot {
 
 struct State {
     snapshots: Vec<Snapshot>,
-    idle_tickets: HashMap<u16, Vec<TicketMsg>>,
+    idle_tickets: Vec<TicketMsg>,
     dispatchrs: HashMap<u16, Vec<mpsc::Sender<TicketMsg>>>,
 }
 impl State {
     fn new() -> Self {
         Self {
             snapshots: vec![],
-            idle_tickets: HashMap::new(),
+            idle_tickets: vec![],
             dispatchrs: HashMap::new(),
         }
     }
@@ -138,22 +138,87 @@ struct DispatcherRegistration {
     tx: mpsc::Sender<TicketMsg>,
 }
 
-async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<Mutex<State>>) {
-    while let Some(s) = rx.recv().await {
-        println!("Got snapshot: {:?}", s);
+async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<State>>) {
+    while let Some(new_snap) = rx.recv().await {
+        println!("Got snapshot: {:?}", new_snap);
+        let mut st = state.lock().await;
+        let cur_idx: usize;
+        if let Some(idx) = st
+            .snapshots
+            .iter()
+            .position(|x| x.plate.timestamp > new_snap.plate.timestamp)
+        {
+            cur_idx = idx.saturating_sub(1);
+            println!("Found at index {idx}, Try insert at {cur_idx}");
+            st.snapshots.insert(cur_idx, new_snap.clone());
+        } else {
+            st.snapshots.push(new_snap.clone());
+            cur_idx = st.snapshots.len() - 1;
+        }
+
+        let mut tickets = vec![];
+
+        st.snapshots
+            .iter()
+            .enumerate()
+            .filter(|(i, x)| {
+                x.plate.plate.content == new_snap.plate.plate.content
+                    && x.from.road == new_snap.from.road
+                    && cur_idx.abs_diff(*i) == 1
+            })
+            .for_each(|(_, x)| {
+                let road = x.from.road;
+                let plate = new_snap.plate.clone();
+                let timestamp1 = new_snap.plate.timestamp.min(x.plate.timestamp);
+                let timestamp2 = new_snap.plate.timestamp.max(x.plate.timestamp);
+                let mile1 = new_snap.from.mile.min(x.from.mile);
+                let mile2 = new_snap.from.mile.max(x.from.mile);
+                let speed = (((mile2 - mile1) as f32) * 10000_f32) / (((timestamp2 - timestamp1) as f32) / 36_f32); // TODO rounding
+                let ticket = TicketMsg {
+                        road,
+                        mile1,
+                        mile2,
+                        timestamp1,
+                        timestamp2,
+                        speed: speed as u16,
+                        plate: plate.plate,
+                    };
+                println!("possible ticket: {:?}", &ticket);
+
+                if ticket.speed > x.from.limit.saturating_mul(100) {
+                    tickets.push(ticket);
+                }
+            });
+
+        for ticket in tickets {
+            if let Some(ds) = st.dispatchrs.get(&ticket.road) {
+                let mut broken = vec![];
+                for (i, d) in ds.iter().enumerate() {
+                    println!("Try sending ticket...");
+                    if let Err(_) = d.send(ticket.clone()).await {
+                        eprintln!("Failed sending ticket...");
+                        broken.push(i);
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                st.idle_tickets.push(ticket);
+            }
+        }
     }
 }
 
 async fn process_dispatchers(
     mut rx: mpsc::Receiver<DispatcherRegistration>,
-    state: Arc<Mutex<State>>,
+    state: Arc<AMutex<State>>,
 ) {
     while let Some(d) = rx.recv().await {
         println!("New dispatcher: {:?}", d.info);
         for road in d.info.roads {
             state
                 .lock()
-                .unwrap()
+                .await
                 .dispatchrs
                 .entry(road)
                 .or_insert(Vec::new())
@@ -164,7 +229,7 @@ async fn process_dispatchers(
 
 #[tokio::main]
 async fn main() {
-    let state = Arc::new(Mutex::new(State::new()));
+    let state = Arc::new(AMutex::new(State::new()));
     let state2 = state.clone();
     let (snap_tx, snap_rx) = mpsc::channel::<Snapshot>(1024);
     let (disp_tx, disp_rx) = mpsc::channel::<DispatcherRegistration>(256);
@@ -266,12 +331,22 @@ async fn handle_dispatcher_conn<R, W>(
         .await
         .unwrap();
 
-    // gettings tickets ready to send to client
+    // gettings tickets to send to client
     while let Some(t) = ticket_rx.recv().await {
         println!("Got ticket: {:?}", t);
+        let mut wl = w.lock().await;
+        wl.write_u8(TICKET_CODE).await.unwrap();
+        wl.write_u8(t.plate.len).await.unwrap();
+        wl.write_all(&t.plate.content).await.unwrap();
+        wl.write_u16(t.road).await.unwrap();
+        wl.write_u16(t.mile1).await.unwrap();
+        wl.write_u32(t.timestamp1).await.unwrap();
+        wl.write_u16(t.mile2).await.unwrap();
+        wl.write_u32(t.timestamp2).await.unwrap();
+        wl.write_u16(t.speed).await.unwrap();
     }
-
     // TODO: handle heartbeat at any point?
+    // TODO: handle disconnect
 }
 
 async fn handle_camera_conn<R, W>(r: &mut R, w: Arc<AMutex<W>>, snapshot_tx: mpsc::Sender<Snapshot>)
@@ -287,7 +362,6 @@ where
         match r.read_u8().await {
             Ok(b) if b == PLATE_CODE => {
                 let plate_msg = PlateMsg::read(r).await;
-                // TODO
                 snapshot_tx
                     .send(Snapshot {
                         plate: plate_msg,
