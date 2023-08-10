@@ -7,6 +7,8 @@ use tokio::{
     sync::{mpsc, Mutex as AMutex},
 };
 
+const SEC_IN_DAYS: f64 = 86400.0;
+
 #[derive(Debug, Clone)]
 struct SrtMsg {
     len: u8,
@@ -55,12 +57,12 @@ impl TicketMsg {
     fn from_snapshots(s1: &Snapshot, s2: &Snapshot) -> Self {
         let road = s1.from.road;
         let plate = s2.plate.clone();
-        let timestamp1 = s1.plate.timestamp.min(s2.plate.timestamp);
-        let timestamp2 = s1.plate.timestamp.max(s2.plate.timestamp);
-        let mile1 = s1.from.mile.min(s2.from.mile);
-        let mile2 = s1.from.mile.max(s2.from.mile);
-        let speed =
-            (((mile2 - mile1) as f32) * 10000_f32) / (((timestamp2 - timestamp1) as f32) / 36_f32); // TODO rounding
+        let timestamp1 = s1.plate.timestamp;
+        let timestamp2 = s2.plate.timestamp;
+        let mile1 = s1.from.mile;
+        let mile2 = s2.from.mile;
+        let speed = (((mile2.abs_diff(mile1)) as f32) * 10000_f32)
+            / (((timestamp2 - timestamp1) as f32) / 36_f32);
         Self {
             road,
             mile1,
@@ -140,6 +142,7 @@ struct Snapshot {
 #[derive(Debug)]
 struct State {
     snapshots: Vec<Snapshot>,
+    issued_tickets: Vec<(Vec<u8>, u32)>,
     idle_tickets: Vec<(TicketMsg, bool)>, // bool marks weather ticket was sent
     dispatchrs: HashMap<u16, Vec<mpsc::Sender<TicketMsg>>>,
 }
@@ -147,6 +150,7 @@ impl State {
     fn new() -> Self {
         Self {
             snapshots: vec![],
+            issued_tickets: vec![],
             idle_tickets: vec![],
             dispatchrs: HashMap::new(),
         }
@@ -161,7 +165,6 @@ struct DispatcherRegistration {
 
 async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<State>>) {
     while let Some(new_snap) = rx.recv().await {
-        println!("[cam] snapshot: {:?}", new_snap);
         let mut st = state.lock().await;
         let cur_idx: usize;
         if let Some(idx) = st.snapshots.iter().position(|x| {
@@ -178,8 +181,6 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
 
         let mut tickets = vec![];
 
-        println!("--- START figuring out ticket");
-
         st.snapshots
             .iter()
             .enumerate()
@@ -189,35 +190,43 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
                     && *i != cur_idx
             })
             .for_each(|(_, x)| {
-                let ticket = TicketMsg::from_snapshots(x, &new_snap);
-                println!("Possible ticket: {:?}", &ticket);
-                if ticket.speed > x.from.limit.saturating_mul(100) {
-                    println!("--- YES ticket");
-                    tickets.push(ticket);
+                let (s1, s2): (&Snapshot, &Snapshot);
+                if new_snap.plate.timestamp > x.plate.timestamp {
+                    (s1, s2) = (x, &new_snap);
                 } else {
-                    println!("--- NO ticket");
+                    (s2, s1) = (x, &new_snap);
+                }
+
+                let ticket = TicketMsg::from_snapshots(s1, s2);
+                if ticket.speed > x.from.limit.saturating_mul(100) {
+                    tickets.push(ticket.clone());
                 }
             });
 
-        println!("--- END figuring out ticket");
-
-        // TODO: removing snapshots?
-        // TODO: 1 ticket per car per day
-
         for ticket in tickets {
-            println!("[cam] Try sending ticket {:?}", &ticket);
+            let from_day = ((ticket.timestamp1 as f64) / SEC_IN_DAYS).floor() as u32;
+            let to_day = ((ticket.timestamp2 as f64) / SEC_IN_DAYS).floor() as u32;
+            if (from_day..=to_day).any(|d| {st
+                    .issued_tickets
+                    .contains(&(ticket.plate.content.clone(), d))
+            }) {
+                continue;
+            } else {
+                for day in from_day..=to_day {
+                    st.issued_tickets.push((ticket.plate.content.clone(), day));
+                }
+            }
             if let Some(ds) = st.dispatchrs.get(&ticket.road) {
                 let mut broken = vec![];
-                for (i, d) in ds.iter().enumerate() {
-                    if let Err(_) = d.send(ticket.clone()).await {
-                        broken.push(i);
+                'dis: for (i, d) in ds.iter().enumerate() {
+                    if let Ok(_) = d.send(ticket.clone()).await {
+                        break 'dis;
                     } else {
-                        break;
+                        broken.push(i);
                     }
                 }
             } else {
-                println!("[cam] sending ticket to idle...");
-                st.idle_tickets.push((ticket, false));
+                st.idle_tickets.push((ticket.clone(), false));
             }
         }
     }
@@ -232,8 +241,7 @@ async fn process_dispatchers(
         let mut st = state.lock().await;
 
         for road in d.info.roads.iter() {
-            st
-                .dispatchrs
+            st.dispatchrs
                 .entry(*road)
                 .or_insert(Vec::new())
                 .push(d.tx.clone());
@@ -319,14 +327,22 @@ fn spawn_heartbeat<W>(w: Arc<AMutex<W>>, interval: f32)
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    if interval > 0_f32 {
-        tokio::spawn(async move {
-            while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
-                println!("-- Sent heartbeat");
-                tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
-            }
-            println!("-- Client disconnected, stopping heartbeat");
-        });
+    tokio::spawn(async move {
+        do_heartbeat(w, interval).await;
+        println!("-- Client disconnected, stopping heartbeat");
+    });
+}
+
+async fn do_heartbeat<W>(w: Arc<AMutex<W>>, interval: f32)
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    if interval <= 0_f32 {
+        return;
+    }
+    while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
+        println!("-- Sent heartbeat");
+        tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
     }
 }
 
@@ -336,7 +352,7 @@ async fn handle_dispatcher_conn<R, W>(
     dispatcher_tx: mpsc::Sender<DispatcherRegistration>,
 ) where
     R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     println!("<dis> Processing dispatcher connection...");
 
@@ -352,20 +368,35 @@ async fn handle_dispatcher_conn<R, W>(
         .await
         .unwrap();
 
-    // gettings tickets to send to client
-    while let Some(t) = ticket_rx.recv().await {
-        println!("<dis> Got ticket: {:?}", t);
-        t.drain(w.clone()).await;
+    let w2 = w.clone();
+    let ticket_listner = tokio::spawn(async move {
+        // gettings tickets to send to client
+        while let Some(t) = ticket_rx.recv().await {
+            t.drain(w2.clone()).await;
+        }
+    });
+
+    match r.read_u8().await {
+        Ok(b) if b == WANT_HEART_BEAT_CODE => {
+            let hb = WantHeartbeatMsg::read(r).await;
+            do_heartbeat(w, hb.interval as f32).await;
+        }
+        Err(_) => {
+            println!("<dis> err reading from dispatcher");
+            ticket_listner.abort();
+        },
+        Ok(b) => {
+            println!("<dis> unknown command {:?}", b);
+            w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap();
+            ticket_listner.abort();
+        }
     }
-    // TODO: handle heartbeat at any point?
-    // TODO: handle disconnect
-    println!("<dis> Closing dispatcher connection");
 }
 
 async fn handle_camera_conn<R, W>(r: &mut R, w: Arc<AMutex<W>>, snapshot_tx: mpsc::Sender<Snapshot>)
 where
     R: AsyncRead + Unpin + Send,
-    W: AsyncWrite + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     println!("[cam] Processing camera connection...");
 
@@ -384,11 +415,18 @@ where
                     .unwrap();
             }
             // TODO: handle heartbeat at any point?
-            Ok(b) if b == WANT_HEART_BEAT_CODE => (),
+            Ok(b) if b == WANT_HEART_BEAT_CODE => {
+                let hb = WantHeartbeatMsg::read(r).await;
+                spawn_heartbeat(w.clone(), hb.interval as f32);
+            }
             Err(_) => {
                 break;
             }
-            _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
+            b @ _ => {
+                println!("[cam] unknown command {:?}", b);
+                w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap();
+                break;
+            }
         }
     }
     println!("[cam] Closing camera connection");
