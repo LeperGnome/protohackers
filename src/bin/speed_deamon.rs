@@ -139,7 +139,7 @@ struct Snapshot {
 
 struct State {
     snapshots: Vec<Snapshot>,
-    idle_tickets: Vec<TicketMsg>,
+    idle_tickets: Vec<(TicketMsg, bool)>,  // bool marks weather ticket was sent
     dispatchrs: HashMap<u16, Vec<mpsc::Sender<TicketMsg>>>,
 }
 impl State {
@@ -187,7 +187,6 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
             })
             .for_each(|(_, x)| {
                 let ticket = TicketMsg::from_snapshots(x, &new_snap);
-
                 if ticket.speed > x.from.limit.saturating_mul(100) {
                     tickets.push(ticket);
                 }
@@ -196,6 +195,7 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
         // TODO: 1 ticket per car per day
 
         for ticket in tickets {
+            println!("[cam] Try sending ticket {:?}", &ticket);
             if let Some(ds) = st.dispatchrs.get(&ticket.road) {
                 let mut broken = vec![];
                 for (i, d) in ds.iter().enumerate() {
@@ -206,7 +206,8 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
                     }
                 }
             } else {
-                st.idle_tickets.push(ticket);
+                println!("[cam] sending ticket to idle...");
+                st.idle_tickets.push((ticket, false));
             }
         }
     }
@@ -230,15 +231,11 @@ async fn process_dispatchers(
 
         // TODO dirty
         let mut st = state.lock().await;
-        let mut to_remove = vec![];
-        for (ti, t) in st.idle_tickets.iter().enumerate() {
-            if d.info.roads.contains(&t.road) {
-                d.tx.send(t.clone()).await.unwrap();
-                to_remove.push(ti);
+        for t in st.idle_tickets.iter_mut() {
+            if !t.1 && d.info.roads.contains(&t.0.road) {
+                d.tx.send(t.0.clone()).await.unwrap();
+                t.1 = true;
             }
-        }
-        for i in to_remove.iter().rev() {
-            st.idle_tickets.remove(*i);
         }
     }
 }
@@ -380,8 +377,7 @@ where
             }
             // TODO: handle heartbeat at any point?
             Ok(b) if b == WANT_HEART_BEAT_CODE => (),
-            Err(e) => {
-                eprintln!("[cam] got error from camera: {e}");
+            Err(_) => {
                 break;
             }
             _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
