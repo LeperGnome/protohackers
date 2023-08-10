@@ -137,9 +137,10 @@ struct Snapshot {
     plate: PlateMsg,
 }
 
+#[derive(Debug)]
 struct State {
     snapshots: Vec<Snapshot>,
-    idle_tickets: Vec<(TicketMsg, bool)>,  // bool marks weather ticket was sent
+    idle_tickets: Vec<(TicketMsg, bool)>, // bool marks weather ticket was sent
     dispatchrs: HashMap<u16, Vec<mpsc::Sender<TicketMsg>>>,
 }
 impl State {
@@ -163,11 +164,11 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
         println!("[cam] snapshot: {:?}", new_snap);
         let mut st = state.lock().await;
         let cur_idx: usize;
-        if let Some(idx) = st
-            .snapshots
-            .iter()
-            .position(|x| x.plate.timestamp > new_snap.plate.timestamp)
-        {
+        if let Some(idx) = st.snapshots.iter().position(|x| {
+            x.plate.timestamp > new_snap.plate.timestamp
+                && x.plate.plate.content == new_snap.plate.plate.content
+                && x.from.road == x.from.road
+        }) {
             cur_idx = idx.saturating_sub(1);
             st.snapshots.insert(cur_idx, new_snap.clone());
         } else {
@@ -177,20 +178,29 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
 
         let mut tickets = vec![];
 
+        println!("--- START figuring out ticket");
+
         st.snapshots
             .iter()
             .enumerate()
             .filter(|(i, x)| {
                 x.plate.plate.content == new_snap.plate.plate.content
                     && x.from.road == new_snap.from.road
-                    && cur_idx.abs_diff(*i) == 1
+                    && *i != cur_idx
             })
             .for_each(|(_, x)| {
                 let ticket = TicketMsg::from_snapshots(x, &new_snap);
+                println!("Possible ticket: {:?}", &ticket);
                 if ticket.speed > x.from.limit.saturating_mul(100) {
+                    println!("--- YES ticket");
                     tickets.push(ticket);
+                } else {
+                    println!("--- NO ticket");
                 }
             });
+
+        println!("--- END figuring out ticket");
+
         // TODO: removing snapshots?
         // TODO: 1 ticket per car per day
 
@@ -219,18 +229,16 @@ async fn process_dispatchers(
 ) {
     while let Some(d) = rx.recv().await {
         println!("<dis> New dispatcher: {:?}", d.info);
+        let mut st = state.lock().await;
+
         for road in d.info.roads.iter() {
-            state
-                .lock()
-                .await
+            st
                 .dispatchrs
                 .entry(*road)
                 .or_insert(Vec::new())
                 .push(d.tx.clone());
         }
 
-        // TODO dirty
-        let mut st = state.lock().await;
         for t in st.idle_tickets.iter_mut() {
             if !t.1 && d.info.roads.contains(&t.0.road) {
                 d.tx.send(t.0.clone()).await.unwrap();
