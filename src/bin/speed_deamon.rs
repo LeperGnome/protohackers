@@ -160,7 +160,7 @@ struct DispatcherRegistration {
 
 async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<State>>) {
     while let Some(new_snap) = rx.recv().await {
-        println!("Got snapshot: {:?}", new_snap);
+        println!("[cam] snapshot: {:?}", new_snap);
         let mut st = state.lock().await;
         let cur_idx: usize;
         if let Some(idx) = st
@@ -169,7 +169,6 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
             .position(|x| x.plate.timestamp > new_snap.plate.timestamp)
         {
             cur_idx = idx.saturating_sub(1);
-            println!("Found at index {idx}, Try insert at {cur_idx}");
             st.snapshots.insert(cur_idx, new_snap.clone());
         } else {
             st.snapshots.push(new_snap.clone());
@@ -188,7 +187,6 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
             })
             .for_each(|(_, x)| {
                 let ticket = TicketMsg::from_snapshots(x, &new_snap);
-                println!("Possible ticket: {:?}", &ticket);
 
                 if ticket.speed > x.from.limit.saturating_mul(100) {
                     tickets.push(ticket);
@@ -201,9 +199,7 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
             if let Some(ds) = st.dispatchrs.get(&ticket.road) {
                 let mut broken = vec![];
                 for (i, d) in ds.iter().enumerate() {
-                    println!("Try sending ticket...");
                     if let Err(_) = d.send(ticket.clone()).await {
-                        eprintln!("Failed sending ticket...");
                         broken.push(i);
                     } else {
                         break;
@@ -221,15 +217,28 @@ async fn process_dispatchers(
     state: Arc<AMutex<State>>,
 ) {
     while let Some(d) = rx.recv().await {
-        println!("New dispatcher: {:?}", d.info);
-        for road in d.info.roads {
+        println!("<dis> New dispatcher: {:?}", d.info);
+        for road in d.info.roads.iter() {
             state
                 .lock()
                 .await
                 .dispatchrs
-                .entry(road)
+                .entry(*road)
                 .or_insert(Vec::new())
                 .push(d.tx.clone());
+        }
+
+        // TODO dirty
+        let mut st = state.lock().await;
+        let mut to_remove = vec![];
+        for (ti, t) in st.idle_tickets.iter().enumerate() {
+            if d.info.roads.contains(&t.road) {
+                d.tx.send(t.clone()).await.unwrap();
+                to_remove.push(ti);
+            }
+        }
+        for i in to_remove.iter().rev() {
+            st.idle_tickets.remove(*i);
         }
     }
 }
@@ -308,10 +317,10 @@ where
     if interval > 0_f32 {
         tokio::spawn(async move {
             while let Ok(_) = w.lock().await.write_all(&[HEART_BEAT_CODE]).await {
-                println!("Sent heartbeat");
+                println!("-- Sent heartbeat");
                 tokio::time::sleep(Duration::from_secs_f32(interval / 10_f32)).await;
             }
-            println!("Client disconnected, stopping heartbeat");
+            println!("-- Client disconnected, stopping heartbeat");
         });
     }
 }
@@ -324,7 +333,7 @@ async fn handle_dispatcher_conn<R, W>(
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    println!("Processing dispatcher connection...");
+    println!("<dis> Processing dispatcher connection...");
 
     let dispatcher_data = IAmDispatcherMsg::read(r).await;
     let (ticket_tx, mut ticket_rx) = mpsc::channel::<TicketMsg>(16);
@@ -340,11 +349,12 @@ async fn handle_dispatcher_conn<R, W>(
 
     // gettings tickets to send to client
     while let Some(t) = ticket_rx.recv().await {
-        println!("Got ticket: {:?}", t);
+        println!("<dis> Got ticket: {:?}", t);
         t.drain(w.clone()).await;
     }
     // TODO: handle heartbeat at any point?
     // TODO: handle disconnect
+    println!("<dis> Closing dispatcher connection");
 }
 
 async fn handle_camera_conn<R, W>(r: &mut R, w: Arc<AMutex<W>>, snapshot_tx: mpsc::Sender<Snapshot>)
@@ -352,10 +362,10 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    println!("Processing camera connection...");
+    println!("[cam] Processing camera connection...");
 
     let camera_info = IAmCameraMsg::read(r).await;
-    println!("Got camera: {:?}", &camera_info);
+    println!("[cam] Got camera: {:?}", &camera_info);
     loop {
         match r.read_u8().await {
             Ok(b) if b == PLATE_CODE => {
@@ -371,11 +381,11 @@ where
             // TODO: handle heartbeat at any point?
             Ok(b) if b == WANT_HEART_BEAT_CODE => (),
             Err(e) => {
-                eprintln!("got error from camera: {e}");
+                eprintln!("[cam] got error from camera: {e}");
                 break;
             }
             _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
         }
     }
-    println!("Closing camera connection");
+    println!("[cam] Closing camera connection");
 }
