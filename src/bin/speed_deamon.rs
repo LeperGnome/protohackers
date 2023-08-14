@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpListener,
     sync::{mpsc, Mutex as AMutex},
 };
 
@@ -206,8 +206,8 @@ async fn process_snapshots(mut rx: mpsc::Receiver<Snapshot>, state: Arc<AMutex<S
         for ticket in tickets {
             let from_day = ((ticket.timestamp1 as f64) / SEC_IN_DAYS).floor() as u32;
             let to_day = ((ticket.timestamp2 as f64) / SEC_IN_DAYS).floor() as u32;
-            if (from_day..=to_day).any(|d| {st
-                    .issued_tickets
+            if (from_day..=to_day).any(|d| {
+                st.issued_tickets
                     .contains(&(ticket.plate.content.clone(), d))
             }) {
                 continue;
@@ -277,49 +277,42 @@ async fn main() {
         let disp_tx = disp_tx.clone();
         match listner.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(async move { handle_stream(stream, snap_tx, disp_tx).await });
+                tokio::spawn(async move {
+                    let (mut r, w) = split(stream);
+                    handle_stream(&mut r, Arc::new(AMutex::new(w)), snap_tx, disp_tx).await
+                });
             }
             Err(e) => println!("Failed accepting connection: {:?}", e),
         };
     }
 }
 
-async fn handle_stream(
-    stream: TcpStream,
+async fn handle_stream<R, W>(
+    r: &mut R,
+    w: Arc<AMutex<W>>,
     snapshot_tx: mpsc::Sender<Snapshot>,
     dispatcher_tx: mpsc::Sender<DispatcherRegistration>,
-) {
-    let (mut r, w) = split(stream);
-    let wa = Arc::new(AMutex::new(w));
+) where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     match r.read_u8().await {
         Ok(b) if b == WANT_HEART_BEAT_CODE => {
-            let hb = WantHeartbeatMsg::read(&mut r).await;
-            spawn_heartbeat(wa.clone(), hb.interval as f32);
+            let hb = WantHeartbeatMsg::read(r).await;
+            spawn_heartbeat(w.clone(), hb.interval as f32);
             match r.read_u8().await {
                 Ok(b) if b == I_AM_DISPATCHER_CODE => {
-                    handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await
+                    handle_dispatcher_conn(r, w, dispatcher_tx).await
                 }
-                Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+                Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(r, w, snapshot_tx).await,
                 Err(_) => return,
-                _ => wa
-                    .lock()
-                    .await
-                    .write_all(&[ERROR_CODE, 0x00])
-                    .await
-                    .unwrap(),
+                _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
             }
         }
-        Ok(b) if b == I_AM_DISPATCHER_CODE => {
-            handle_dispatcher_conn(&mut r, wa, dispatcher_tx).await
-        }
-        Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(&mut r, wa, snapshot_tx).await,
+        Ok(b) if b == I_AM_DISPATCHER_CODE => handle_dispatcher_conn(r, w, dispatcher_tx).await,
+        Ok(b) if b == I_AM_CAMERA_CODE => handle_camera_conn(r, w, snapshot_tx).await,
         Err(_) => return,
-        _ => wa
-            .lock()
-            .await
-            .write_all(&[ERROR_CODE, 0x00])
-            .await
-            .unwrap(),
+        _ => w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap(),
     };
 }
 
@@ -384,7 +377,7 @@ async fn handle_dispatcher_conn<R, W>(
         Err(_) => {
             println!("<dis> err reading from dispatcher");
             ticket_listner.abort();
-        },
+        }
         Ok(b) => {
             println!("<dis> unknown command {:?}", b);
             w.lock().await.write_all(&[ERROR_CODE, 0x00]).await.unwrap();
@@ -414,7 +407,6 @@ where
                     .await
                     .unwrap();
             }
-            // TODO: handle heartbeat at any point?
             Ok(b) if b == WANT_HEART_BEAT_CODE => {
                 let hb = WantHeartbeatMsg::read(r).await;
                 spawn_heartbeat(w.clone(), hb.interval as f32);
