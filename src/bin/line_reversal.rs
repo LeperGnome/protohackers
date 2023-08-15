@@ -9,20 +9,22 @@ enum Message {
     Close,
 }
 impl Message {
-    fn parse(s: &str) -> Result<(u32, Message), ()> {
-        let mut tmp = s.splitn(3, '/').skip(1);
+    fn from_buf(buf: &[u8]) -> Result<(u32, Message), ()> {
+        let msg = std::str::from_utf8(&buf).or(Err(()))?;
+
+        let mut tmp = msg.splitn(4, '/').skip(1);
         let cmd = tmp.next();
-        let session_id = tmp.next().unwrap().parse::<u32>().unwrap_or_else(|_| {println!("nope"); return 0});
+        let session_id = tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?;
 
         match cmd {
             Some(cmd) if cmd == "connect" => Ok((session_id, Message::Connect)),
             Some(cmd) if cmd == "data" => Ok((
                 session_id,
-                Message::Data(tmp.next().unwrap().parse::<Payload>().unwrap()),
+                Message::Data(tmp.next().ok_or(())?.parse::<Payload>()?),
             )),
             Some(cmd) if cmd == "ack" => Ok((
                 session_id,
-                Message::Ack(tmp.next().unwrap().parse::<u32>().unwrap()),
+                Message::Ack(tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?),
             )),
             Some(cmd) if cmd == "close" => Ok((session_id, Message::Close)),
             Some(_) | None => Err(()),
@@ -66,8 +68,7 @@ async fn main() {
 
     loop {
         let (amt, addr) = sock.recv_from(&mut buf).await.unwrap();
-        if let Ok(msg) = std::str::from_utf8(&buf[..amt]) {
-            let (session_id, msg) = Message::parse(msg).unwrap(); // TODO
+        if let Ok((session_id, msg)) = Message::from_buf(&buf[..amt]) {
             match msg {
                 Message::Connect => {
                     sessions.push(Session {
@@ -79,10 +80,10 @@ async fn main() {
                         .await
                         .unwrap();
                 }
-                _ => (),
+                _ => todo!(),
             };
         } else {
-            eprintln!("Could not parse message");
+            eprintln!("error parsing message");
         }
     }
 }
