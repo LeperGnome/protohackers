@@ -2,14 +2,21 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::mpsc};
 
 #[derive(Debug)]
-enum Message {
+enum MessageData {
     Connect,
     Data(Payload),
     Ack(u32),
     Close,
 }
+
+#[derive(Debug)]
+struct Message {
+    session_id: u32,
+    data: MessageData,
+}
+
 impl Message {
-    fn from_buf(buf: &[u8]) -> Result<(u32, Message), ()> {
+    fn from_buf(buf: &[u8]) -> Result<Message, ()> {
         let msg = std::str::from_utf8(&buf)
             .or(Err(()))?
             .strip_prefix("/")
@@ -23,21 +30,32 @@ impl Message {
         let session_id = tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?;
 
         match cmd {
-            Some(cmd) if cmd == "connect" => Ok((session_id, Message::Connect)),
-            Some(cmd) if cmd == "data" => Ok((
+            Some(cmd) if cmd == "connect" => Ok(Message {
                 session_id,
-                Message::Data(tmp.next().ok_or(())?.parse::<Payload>()?),
-            )),
-            Some(cmd) if cmd == "ack" => Ok((
+                data: MessageData::Connect,
+            }),
+            Some(cmd) if cmd == "data" => Ok(Message {
                 session_id,
-                Message::Ack(tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?),
-            )),
-            Some(cmd) if cmd == "close" => Ok((session_id, Message::Close)),
+                data: MessageData::Data(tmp.next().ok_or(())?.parse::<Payload>()?),
+            }),
+            Some(cmd) if cmd == "ack" => Ok(Message {
+                session_id,
+                data: MessageData::Ack(tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?),
+            }),
+            Some(cmd) if cmd == "close" => Ok(Message {
+                session_id,
+                data: MessageData::Close,
+            }),
             Some(_) | None => Err(()),
         }
     }
-    fn as_bytes(&self) -> &[u8] {
-        todo!();
+    fn to_string(&self) -> String {
+        match &self.data {
+            MessageData::Connect => format!("/connect/{}/", self.session_id),
+            MessageData::Data(p) => format!("/data/{}/{}/{}/", self.session_id, p.pos, p.data),
+            MessageData::Ack(l) => format!("/ack/{}/{}/", self.session_id, l),
+            MessageData::Close => format!("/close/{}/", self.session_id),
+        }
     }
 }
 
@@ -67,13 +85,30 @@ struct Session {
 }
 
 async fn handle_session(
-    id: u32,
     peer_addr: SocketAddr,
     mut writer: mpsc::Sender<(Message, SocketAddr)>,
     mut reader: mpsc::Receiver<Message>,
 ) {
     while let Some(msg) = reader.recv().await {
-        println!("[{id} : {peer_addr}] got message: '{:?}'", msg);
+        println!(
+            "[{} : {peer_addr}] got message: '{:?}'",
+            msg.session_id, msg.data
+        );
+        let resp_msg_data = match msg.data {
+            MessageData::Connect => MessageData::Ack(0),
+            _ => MessageData::Close,
+        };
+
+        writer
+            .send((
+                Message {
+                    session_id: msg.session_id,
+                    data: resp_msg_data,
+                },
+                peer_addr,
+            ))
+            .await
+            .unwrap();
     }
 }
 
@@ -91,7 +126,7 @@ async fn main() {
 
     _ = tokio::spawn(async move {
         while let Some((msg, addr)) = writer_rx.recv().await {
-            if let Err(e) = w_sock.send_to(msg.as_bytes(), addr).await {
+            if let Err(e) = w_sock.send_to(msg.to_string().as_bytes(), addr).await {
                 eprintln!("Error sending message {:?} to {}, error: {}", msg, addr, e);
             }
         }
@@ -100,30 +135,30 @@ async fn main() {
     loop {
         let writer_tx = writer_tx.clone();
         let (amt, addr) = sock.recv_from(&mut buf).await.unwrap();
-        if let Ok((session_id, msg)) = Message::from_buf(&buf[..amt]) {
-            match msg {
-                Message::Connect => {
+        if let Ok(msg) = Message::from_buf(&buf[..amt]) {
+            match msg.data {
+                MessageData::Connect => {
                     let (session_tx, session_rx) = mpsc::channel::<Message>(100);
                     tokio::spawn(async move {
-                        handle_session(session_id, addr, writer_tx.clone(), session_rx).await;
+                        handle_session(addr, writer_tx.clone(), session_rx).await;
                     });
                     sessions
-                        .entry(session_id)
+                        .entry(msg.session_id)
                         .or_insert(Session {
+                            id: msg.session_id,
                             peer_addr: addr,
-                            id: session_id,
                             tx: session_tx,
                         })
                         .tx
-                        .send(Message::Connect)
+                        .send(msg)
                         .await
                         .unwrap();
                 }
-                m @ _ => {
-                    if let Some(session) = sessions.get(&session_id) {
-                        session.tx.send(m).await.unwrap();
+                _ => {
+                    if let Some(session) = sessions.get(&msg.session_id) {
+                        session.tx.send(msg).await.unwrap();
                     } else {
-                        sock.send_to(format!("/close/{}/", session_id).as_bytes(), addr)
+                        sock.send_to(format!("/close/{}/", msg.session_id).as_bytes(), addr)
                             .await
                             .unwrap();
                     }
