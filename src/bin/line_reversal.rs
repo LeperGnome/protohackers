@@ -79,37 +79,7 @@ impl std::str::FromStr for Payload {
 }
 
 struct Session {
-    id: u32,
-    peer_addr: SocketAddr,
     tx: mpsc::Sender<Message>,
-}
-
-async fn handle_session(
-    peer_addr: SocketAddr,
-    mut writer: mpsc::Sender<(Message, SocketAddr)>,
-    mut reader: mpsc::Receiver<Message>,
-) {
-    while let Some(msg) = reader.recv().await {
-        println!(
-            "[{} : {peer_addr}] got message: '{:?}'",
-            msg.session_id, msg.data
-        );
-        let resp_msg_data = match msg.data {
-            MessageData::Connect => MessageData::Ack(0),
-            _ => MessageData::Close,
-        };
-
-        writer
-            .send((
-                Message {
-                    session_id: msg.session_id,
-                    data: resp_msg_data,
-                },
-                peer_addr,
-            ))
-            .await
-            .unwrap();
-    }
 }
 
 #[tokio::main]
@@ -135,37 +105,72 @@ async fn main() {
     loop {
         let (amt, addr) = sock.recv_from(&mut buf).await.unwrap();
         if let Ok(msg) = Message::from_buf(&buf[..amt]) {
-            match msg.data {
-                MessageData::Connect => {
-                    let (session_tx, session_rx) = mpsc::channel::<Message>(100);
-                    let writer_tx = writer_tx.clone();
-                    tokio::spawn(async move {
-                        handle_session(addr, writer_tx.clone(), session_rx).await;
-                    });
-                    sessions
-                        .entry(msg.session_id)
-                        .or_insert(Session {
-                            id: msg.session_id,
-                            peer_addr: addr,
-                            tx: session_tx,
-                        })
-                        .tx
-                        .send(msg)
-                        .await
-                        .unwrap();
-                }
-                _ => {
-                    if let Some(session) = sessions.get(&msg.session_id) {
-                        session.tx.send(msg).await.unwrap();
-                    } else {
-                        sock.send_to(format!("/close/{}/", msg.session_id).as_bytes(), addr)
-                            .await
-                            .unwrap();
-                    }
-                }
-            };
+            let session_id = msg.session_id;
+
+            // registers session
+            if matches!(msg.data, MessageData::Connect) && sessions.get(&msg.session_id).is_none() {
+                register_session(&mut sessions, session_id, addr, writer_tx.clone()).await;
+            }
+            // transmit message to appropriate session
+            if let Err(_) = transmit_to_session(&sessions, msg).await {
+                sock.send_to(format!("/close/{}/", session_id).as_bytes(), addr)
+                    .await
+                    .unwrap();
+                // TODO remove session?
+            }
         } else {
             eprintln!("error parsing message");
         }
+    }
+}
+
+async fn register_session(
+    sessions: &mut HashMap<u32, Session>,
+    session_id: u32,
+    addr: SocketAddr,
+    writer: mpsc::Sender<(Message, SocketAddr)>,
+) {
+    let (session_tx, session_rx) = mpsc::channel::<Message>(100);
+    tokio::spawn(async move {
+        handle_session(addr, writer, session_rx).await;
+    });
+    sessions.insert(session_id, Session { tx: session_tx });
+}
+
+async fn transmit_to_session(sessions: &HashMap<u32, Session>, msg: Message) -> Result<(), ()> {
+    if let Some(session) = sessions.get(&msg.session_id) {
+        session.tx.send(msg).await.or(Err(()))?;
+        return Ok(());
+    }
+    return Err(());
+}
+
+async fn handle_session(
+    peer_addr: SocketAddr,
+    writer: mpsc::Sender<(Message, SocketAddr)>,
+    mut reader: mpsc::Receiver<Message>,
+) {
+    while let Some(msg) = reader.recv().await {
+        println!(
+            "[{} : {peer_addr}] got message: '{:?}'",
+            msg.session_id, msg.data
+        );
+        let resp_msg_data = match msg.data {
+            MessageData::Connect => MessageData::Ack(0),
+            MessageData::Data(p) => todo!(),
+            MessageData::Ack(n) => todo!(),
+            MessageData::Close => MessageData::Close,
+        };
+
+        writer
+            .send((
+                Message {
+                    session_id: msg.session_id,
+                    data: resp_msg_data,
+                },
+                peer_addr,
+            ))
+            .await
+            .unwrap();
     }
 }
