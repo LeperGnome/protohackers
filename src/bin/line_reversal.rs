@@ -133,12 +133,12 @@ async fn main() {
     });
 
     loop {
-        let writer_tx = writer_tx.clone();
         let (amt, addr) = sock.recv_from(&mut buf).await.unwrap();
         if let Ok(msg) = Message::from_buf(&buf[..amt]) {
             match msg.data {
                 MessageData::Connect => {
                     let (session_tx, session_rx) = mpsc::channel::<Message>(100);
+                    let writer_tx = writer_tx.clone();
                     tokio::spawn(async move {
                         handle_session(addr, writer_tx.clone(), session_rx).await;
                     });
