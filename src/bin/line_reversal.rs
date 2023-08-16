@@ -1,17 +1,49 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket, sync::mpsc};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum MessageData {
     Connect,
     Data(Payload),
-    Ack(u32),
+    Ack(usize),
     Close,
+}
+
+#[derive(Debug, Clone)]
+struct Payload {
+    pos: usize,
+    data: String,
+}
+impl std::str::FromStr for Payload {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Payload, Self::Err> {
+        match s.split_once("/") {
+            Some((pos, data)) => Ok(Self {
+                pos: pos.parse::<usize>().or(Err(()))?,
+                data: unescape_data(data),
+            }),
+            None => Err(()),
+        }
+    }
+}
+impl Payload {
+    fn to_string(&self) -> String {
+        return format!("{}/{}", self.pos, escape_data(&self.data));
+    }
+}
+
+fn escape_data(s: &str) -> String {
+    s.replace(r"/", r"\/").replace(r"\", r"\\")
+}
+
+fn unescape_data(s: &str) -> String {
+    s.replace(r"\/", r"/").replace(r"\\", r"\")
 }
 
 #[derive(Debug)]
 struct Message {
-    session_id: u32,
+    session_id: usize,
     data: MessageData,
 }
 
@@ -21,13 +53,13 @@ impl Message {
             .or(Err(()))?
             .strip_prefix("/")
             .ok_or(())?
-            .trim_end() // TODO: use for debug
+            .trim_end() // TODO: used for debugging
             .strip_suffix("/")
             .ok_or(())?;
 
         let mut tmp = msg.splitn(3, '/'); //.skip(1);
         let cmd = tmp.next();
-        let session_id = tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?;
+        let session_id = tmp.next().ok_or(())?.parse::<usize>().or(Err(()))?;
 
         match cmd {
             Some(cmd) if cmd == "connect" => Ok(Message {
@@ -40,7 +72,7 @@ impl Message {
             }),
             Some(cmd) if cmd == "ack" => Ok(Message {
                 session_id,
-                data: MessageData::Ack(tmp.next().ok_or(())?.parse::<u32>().or(Err(()))?),
+                data: MessageData::Ack(tmp.next().ok_or(())?.parse::<usize>().or(Err(()))?),
             }),
             Some(cmd) if cmd == "close" => Ok(Message {
                 session_id,
@@ -52,28 +84,9 @@ impl Message {
     fn to_string(&self) -> String {
         match &self.data {
             MessageData::Connect => format!("/connect/{}/", self.session_id),
-            MessageData::Data(p) => format!("/data/{}/{}/{}/", self.session_id, p.pos, p.data),
+            MessageData::Data(p) => format!("/data/{}/{}/", self.session_id, p.to_string()),
             MessageData::Ack(l) => format!("/ack/{}/{}/", self.session_id, l),
             MessageData::Close => format!("/close/{}/", self.session_id),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Payload {
-    pos: u32,
-    data: String,
-}
-impl std::str::FromStr for Payload {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Payload, Self::Err> {
-        match s.split_once("/") {
-            Some((pos, data)) => Ok(Self {
-                pos: pos.parse::<u32>().or(Err(()))?,
-                data: data.to_string(),
-            }),
-            None => Err(()),
         }
     }
 }
@@ -87,7 +100,7 @@ async fn main() {
     let sock = UdpSocket::bind("0.0.0.0:7878").await.unwrap();
     let sock = Arc::new(sock);
 
-    let mut sessions: HashMap<u32, Session> = HashMap::new();
+    let mut sessions: HashMap<usize, Session> = HashMap::new();
     let mut buf = [0; 1024];
 
     let (writer_tx, mut writer_rx) = mpsc::channel::<(Message, SocketAddr)>(100);
@@ -113,9 +126,17 @@ async fn main() {
             }
             // transmit message to appropriate session
             if let Err(_) = transmit_to_session(&sessions, msg).await {
-                sock.send_to(format!("/close/{}/", session_id).as_bytes(), addr)
-                    .await
-                    .unwrap();
+                sock.send_to(
+                    Message {
+                        session_id,
+                        data: MessageData::Close,
+                    }
+                    .to_string()
+                    .as_bytes(),
+                    addr,
+                )
+                .await
+                .unwrap();
                 // TODO remove session?
             }
         } else {
@@ -125,8 +146,8 @@ async fn main() {
 }
 
 async fn register_session(
-    sessions: &mut HashMap<u32, Session>,
-    session_id: u32,
+    sessions: &mut HashMap<usize, Session>,
+    session_id: usize,
     addr: SocketAddr,
     writer: mpsc::Sender<(Message, SocketAddr)>,
 ) {
@@ -137,7 +158,7 @@ async fn register_session(
     sessions.insert(session_id, Session { tx: session_tx });
 }
 
-async fn transmit_to_session(sessions: &HashMap<u32, Session>, msg: Message) -> Result<(), ()> {
+async fn transmit_to_session(sessions: &HashMap<usize, Session>, msg: Message) -> Result<(), ()> {
     if let Some(session) = sessions.get(&msg.session_id) {
         session.tx.send(msg).await.or(Err(()))?;
         return Ok(());
@@ -150,6 +171,15 @@ async fn handle_session(
     writer: mpsc::Sender<(Message, SocketAddr)>,
     mut reader: mpsc::Receiver<Message>,
 ) {
+    let mut max_client_pos: usize = 0;
+    let mut max_client_ack: usize = 0;
+    let mut max_server_pos: usize = 0;
+
+    let mut sent_bin: Vec<u8> = vec![];
+    let mut recv_bin: Vec<u8> = vec![];
+
+    let mut last_sent_ack = MessageData::Ack(0);
+
     while let Some(msg) = reader.recv().await {
         println!(
             "[{} : {peer_addr}] got message: '{:?}'",
@@ -157,8 +187,22 @@ async fn handle_session(
         );
         let resp_msg_data = match msg.data {
             MessageData::Connect => MessageData::Ack(0),
-            MessageData::Data(p) => todo!(),
-            MessageData::Ack(n) => todo!(),
+            MessageData::Data(p) => {
+                if p.pos == max_client_pos {
+                    max_client_pos += p.data.len();
+                    last_sent_ack = MessageData::Ack(max_client_pos);
+                    recv_bin.append(&mut p.data.as_bytes().to_vec());
+                }
+                last_sent_ack.clone()
+            }
+            MessageData::Ack(n) if n <= max_client_ack => continue,
+            MessageData::Ack(n) if n == max_server_pos => continue,
+            MessageData::Ack(n) if n > max_server_pos => MessageData::Close,
+            MessageData::Ack(n) if n < max_server_pos => MessageData::Data(Payload {
+                pos: n,
+                data: std::str::from_utf8(&sent_bin[n..]).unwrap().to_string(),
+            }),
+            MessageData::Ack(_) => unreachable!(),
             MessageData::Close => MessageData::Close,
         };
 
