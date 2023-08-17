@@ -324,7 +324,7 @@ impl LRCPSession {
             .send((msg_o, self.peer_addr))
             .await
             .or(Err("Failed sending message =(".to_string()))?;
-        self.sent_bin.append(&mut message.as_bytes().to_vec());
+        self.sent_bin.append(&mut data.as_bytes().to_vec());
         self.max_server_pos += data.len();
         Ok(())
     }
