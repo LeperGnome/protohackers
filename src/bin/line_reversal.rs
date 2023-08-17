@@ -38,7 +38,7 @@ impl Payload {
 }
 
 fn escape_data(s: &str) -> String {
-    s.replace(r"/", r"\/").replace(r"\", r"\\")
+    s.replace(r"\", r"\\").replace(r"/", r"\/")
 }
 
 fn unescape_data(s: &str) -> String {
@@ -212,6 +212,7 @@ struct LRCPSession {
 
     sent_bin: Vec<u8>,
     recv_bin: Vec<u8>,
+    consumed: usize,
 }
 impl LRCPSession {
     fn new(id: usize, peer_addr: SocketAddr, writer: LRCPSender, reader: LRCPReceiver) -> Self {
@@ -226,15 +227,15 @@ impl LRCPSession {
             last_sent_ack_n: 0,
             sent_bin: vec![],
             recv_bin: vec![],
+            consumed: 0,
         }
     }
-    async fn read_str(&mut self) -> Result<String, String> {
-        // TODO ugly
-        let mut req_data = None;
-        while matches!(req_data, None) {
+    async fn read(&mut self) -> Result<usize, String> {
+        let mut req_len = None;
+        while matches!(req_len, None) {
             if let Some(msg) = self.reader.recv().await {
                 println!(
-                    "[{} : {}] got message: '{:?}'",
+                    "[{} : {}] --> '{:?}'",
                     self.peer_addr, msg.session_id, msg.data
                 );
                 let resp_msg_data = match msg.data {
@@ -244,7 +245,7 @@ impl LRCPSession {
                             self.max_client_pos += p.data.len();
                             self.last_sent_ack_n = self.max_client_pos;
                             self.recv_bin.append(&mut p.data.as_bytes().to_vec());
-                            req_data = Some(p.data);
+                            req_len = Some(p.data.len());
                         }
                         Some(MessageData::Ack(self.last_sent_ack_n))
                     }
@@ -264,6 +265,7 @@ impl LRCPSession {
                 };
 
                 if let Some(data) = resp_msg_data {
+                    println!("[{} : {}] <-- '{:?}'", self.peer_addr, msg.session_id, data);
                     self.writer
                         .send((
                             Message {
@@ -277,25 +279,53 @@ impl LRCPSession {
                 }
             }
         }
-        Ok(req_data.unwrap())
+        Ok(req_len.unwrap())
     }
 
-    async fn write_str(&mut self, message: &str) -> Result<(), String> {
+    async fn read_until(&mut self, c: char) -> Result<String, String> {
+        let c = c as u8;
+        loop {
+            match self.get_form_buf(c).await {
+                Some(data) => return Ok(data),
+                None => self.read().await?,
+            };
+        }
+    }
+
+    async fn get_form_buf(&mut self, c: u8) -> Option<String> {
+        let lo = self.consumed;
+        for hi in lo..self.recv_bin.len() {
+            if self.recv_bin[hi] == c {
+                self.consumed = hi + 1;
+                return Some(
+                    std::str::from_utf8(&self.recv_bin[lo..hi])
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+        return None;
+    }
+
+    async fn write(&mut self, message: &str) -> Result<(), String> {
+        let data = format!("{}\n", message);
+        let msg_o = Message {
+            session_id: self.id,
+            data: MessageData::Data(Payload {
+                pos: self.max_server_pos,
+                data: data.clone(),
+            }),
+        };
+        println!(
+            "[{} : {}] <-- '{:?}'",
+            self.peer_addr, msg_o.session_id, msg_o.data
+        );
         self.writer
-            .send((
-                Message {
-                    session_id: self.id,
-                    data: MessageData::Data(Payload {
-                        pos: self.max_server_pos,
-                        data: message.into(),
-                    }),
-                },
-                self.peer_addr,
-            ))
+            .send((msg_o, self.peer_addr))
             .await
             .or(Err("Failed sending message =(".to_string()))?;
         self.sent_bin.append(&mut message.as_bytes().to_vec());
-        self.max_server_pos += message.len();
+        self.max_server_pos += data.len();
         Ok(())
     }
 }
@@ -305,12 +335,22 @@ async fn main() {
     let listner = LRCPListner::bind("0.0.0.0:7878").await.unwrap();
     let mut session_rx = listner.listen().await;
 
-    while let Some(mut session) = session_rx.recv().await {
+    while let Some(session) = session_rx.recv().await {
         tokio::spawn(async move {
-            while let Ok(msg) = session.read_str().await {
-                let rev_msg = msg.chars().rev().collect::<String>();
-                session.write_str(&rev_msg).await.unwrap();
-            }
+            handle_session(session).await;
         });
     }
+}
+
+async fn handle_session(mut session: LRCPSession) {
+    println!("[{} : {}] connected", session.peer_addr, session.id);
+    while let Ok(msg) = session.read_until('\n').await {
+        println!(
+            "[{} : {}] got line: '{}'",
+            session.peer_addr, session.id, msg
+        );
+        let rev_msg = msg.chars().rev().collect::<String>();
+        session.write(&rev_msg).await.unwrap();
+    }
+    println!("[{} : {}] closed", session.peer_addr, session.id);
 }
