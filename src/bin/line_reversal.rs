@@ -285,7 +285,10 @@ impl LRCPSession {
             .send((
                 Message {
                     session_id: self.id,
-                    data: MessageData::Data(Payload {pos: self.max_server_pos, data: message.into()}),
+                    data: MessageData::Data(Payload {
+                        pos: self.max_server_pos,
+                        data: message.into(),
+                    }),
                 },
                 self.peer_addr,
             ))
