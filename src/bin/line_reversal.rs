@@ -95,110 +95,6 @@ impl Message {
     }
 }
 
-// async fn old_main() {
-//     let sock = UdpSocket::bind("0.0.0.0:7878").await.unwrap();
-//     let sock = Arc::new(sock);
-//
-//     let mut sessions: HashMap<usize, Session> = HashMap::new();
-//     let mut buf = [0; 1024];
-//
-//     let (writer_tx, mut writer_rx) = mpsc::channel::<(Message, SocketAddr)>(100);
-//
-//     let w_sock = sock.clone();
-//
-//     _ = tokio::spawn(async move {
-//         while let Some((msg, addr)) = writer_rx.recv().await {
-//             if let Err(e) = w_sock.send_to(msg.to_string().as_bytes(), addr).await {
-//                 eprintln!("Error sending message {:?} to {}, error: {}", msg, addr, e);
-//             }
-//         }
-//     });
-//
-//     loop {
-//         let (amt, addr) = sock.recv_from(&mut buf).await.unwrap();
-//         if let Ok(msg) = Message::from_buf(&buf[..amt]) {
-//             let session_id = msg.session_id;
-//
-//             // registers session
-//             if matches!(msg.data, MessageData::Connect) && sessions.get(&msg.session_id).is_none() {
-//                 register_session(&mut sessions, session_id, addr, writer_tx.clone()).await;
-//             }
-//             // transmit message to appropriate session
-//             if let Err(_) = transmit_to_session(&sessions, msg).await {
-//                 sock.send_to(
-//                     Message {
-//                         session_id,
-//                         data: MessageData::Close,
-//                     }
-//                     .to_string()
-//                     .as_bytes(),
-//                     addr,
-//                 )
-//                 .await
-//                 .unwrap();
-//                 // TODO remove session?
-//             }
-//         } else {
-//             eprintln!("error parsing message");
-//         }
-//     }
-// }
-//
-// async fn handle_session(
-//     peer_addr: SocketAddr,
-//     writer: mpsc::Sender<(Message, SocketAddr)>,
-//     mut reader: mpsc::Receiver<Message>,
-// ) {
-//     let mut max_client_pos: usize = 0;
-//     let mut max_client_ack: usize = 0;
-//     let mut max_server_pos: usize = 0;
-//
-//     let mut sent_bin: Vec<u8> = vec![];
-//     let mut recv_bin: Vec<u8> = vec![];
-//
-//     let mut last_sent_ack = MessageData::Ack(0);
-//
-//     while let Some(msg) = reader.recv().await {
-//         println!(
-//             "[{} : {peer_addr}] got message: '{:?}'",
-//             msg.session_id, msg.data
-//         );
-//         let resp_msg_data = match msg.data {
-//             MessageData::Connect => MessageData::Ack(0),
-//             MessageData::Data(p) => {
-//                 if p.pos == max_client_pos {
-//                     max_client_pos += p.data.len();
-//                     last_sent_ack = MessageData::Ack(max_client_pos);
-//                     recv_bin.append(&mut p.data.as_bytes().to_vec());
-//                 }
-//                 last_sent_ack.clone()
-//             }
-//             MessageData::Ack(n) if n <= max_client_ack => continue,
-//             MessageData::Ack(n) if n == max_server_pos => continue,
-//             MessageData::Ack(n) if n > max_server_pos => MessageData::Close,
-//             MessageData::Ack(n) if n < max_server_pos => MessageData::Data(Payload {
-//                 pos: n,
-//                 data: std::str::from_utf8(&sent_bin[n..]).unwrap().to_string(),
-//             }),
-//             MessageData::Ack(_) => unreachable!(),
-//             MessageData::Close => MessageData::Close,
-//         };
-//
-//         writer
-//             .send((
-//                 Message {
-//                     session_id: msg.session_id,
-//                     data: resp_msg_data,
-//                 },
-//                 peer_addr,
-//             ))
-//             .await
-//             .unwrap();
-//     }
-// }
-
-// ------------------ sandbox -----------------
-
 struct LRCPListner {
     sock: Arc<UdpSocket>,
     session_senders: HashMap<usize, mpsc::Sender<Message>>,
@@ -285,7 +181,7 @@ impl LRCPListner {
     ) {
         let (session_tx, session_rx) = mpsc::channel::<Message>(100);
         listen_tx
-            .send(LRCPSession::new(addr, writer, session_rx))
+            .send(LRCPSession::new(session_id, addr, writer, session_rx))
             .await
             .unwrap();
         self.session_senders.insert(session_id, session_tx);
@@ -304,6 +200,7 @@ type LRCPSender = mpsc::Sender<(Message, SocketAddr)>;
 type LRCPReceiver = mpsc::Receiver<Message>;
 
 struct LRCPSession {
+    id: usize,
     peer_addr: SocketAddr,
     writer: LRCPSender,
     reader: LRCPReceiver,
@@ -317,8 +214,9 @@ struct LRCPSession {
     recv_bin: Vec<u8>,
 }
 impl LRCPSession {
-    fn new(peer_addr: SocketAddr, writer: LRCPSender, reader: LRCPReceiver) -> Self {
+    fn new(id: usize, peer_addr: SocketAddr, writer: LRCPSender, reader: LRCPReceiver) -> Self {
         LRCPSession {
+            id,
             peer_addr,
             reader,
             writer,
@@ -383,7 +281,18 @@ impl LRCPSession {
     }
 
     async fn write_str(&mut self, message: &str) -> Result<(), String> {
-        println!("TODO: will send message '{}'", message);
+        self.writer
+            .send((
+                Message {
+                    session_id: self.id,
+                    data: MessageData::Data(Payload {pos: self.max_server_pos, data: message.into()}),
+                },
+                self.peer_addr,
+            ))
+            .await
+            .or(Err("Failed sending message =(".to_string()))?;
+        self.sent_bin.append(&mut message.as_bytes().to_vec());
+        self.max_server_pos += message.len();
         Ok(())
     }
 }
