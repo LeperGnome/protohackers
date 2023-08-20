@@ -3,7 +3,11 @@ use std::{
     net::{SocketAddr, ToSocketAddrs},
     sync::Arc,
 };
-use tokio::{net::UdpSocket, sync::mpsc};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc,
+    time::{timeout, Duration, Instant},
+};
 
 #[derive(Debug, Clone)]
 enum MessageData {
@@ -23,10 +27,17 @@ impl std::str::FromStr for Payload {
 
     fn from_str(s: &str) -> Result<Payload, Self::Err> {
         match s.split_once("/") {
-            Some((pos, data)) => Ok(Self {
-                pos: pos.parse::<usize>().or(Err(()))?,
-                data: unescape_data(data),
-            }),
+            Some((pos, data)) => {
+                if data.chars().filter(|c| *c == '/').count()
+                    > data.chars().filter(|c| *c == '\\').count()
+                {
+                    return Err(());
+                }
+                Ok(Self {
+                    pos: pos.parse::<usize>().or(Err(()))?,
+                    data: unescape_data(data),
+                })
+            }
             None => Err(()),
         }
     }
@@ -45,7 +56,7 @@ fn unescape_data(s: &str) -> String {
     s.replace(r"\/", r"/").replace(r"\\", r"\")
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Message {
     session_id: usize,
     data: MessageData,
@@ -61,7 +72,7 @@ impl Message {
             .strip_suffix("/")
             .ok_or(())?;
 
-        let mut tmp = msg.splitn(3, '/'); //.skip(1);
+        let mut tmp = msg.splitn(3, '/');
         let cmd = tmp.next();
         let session_id = tmp.next().ok_or(())?.parse::<usize>().or(Err(()))?;
 
@@ -132,7 +143,6 @@ impl LRCPListner {
         _ = tokio::spawn(async move {
             while let Some((msg, addr)) = sock_writer_rx.recv().await {
                 if let Err(e) = w_sock.send_to(msg.to_string().as_bytes(), addr).await {
-                    // TODO client disconnected? no way of measuring timeout or smth
                     eprintln!("Error sending message {:?} to {}, error: {}", msg, addr, e);
                 }
             }
@@ -164,10 +174,13 @@ impl LRCPListner {
                         )
                         .await
                         .unwrap();
-                    // TODO remove session?
+                    self.session_senders.remove(&session_id);
                 }
             } else {
-                eprintln!("error parsing message");
+                eprintln!(
+                    "error parsing message: '{}'",
+                    std::str::from_utf8(&self.buf[..amt]).unwrap()
+                );
             }
         }
     }
@@ -297,17 +310,19 @@ impl LRCPSession {
         for hi in lo..self.recv_bin.len() {
             if self.recv_bin[hi] == c {
                 self.consumed = hi + 1;
-                return Some(
-                    std::str::from_utf8(&self.recv_bin[lo..hi])
-                        .unwrap()
-                        .to_string(),
-                );
+                let msg = std::str::from_utf8(&self.recv_bin[lo..hi])
+                    .unwrap()
+                    .to_string();
+                return Some(msg);
             }
         }
         return None;
     }
 
     async fn write(&mut self, message: &str) -> Result<(), String> {
+        const RETRY_TIMES: u8 = 20;
+        const ACK_WAIT: u64 = 3;
+
         let data = format!("{}\n", message);
         let msg_o = Message {
             session_id: self.id,
@@ -316,17 +331,42 @@ impl LRCPSession {
                 data: data.clone(),
             }),
         };
-        println!(
-            "[{} : {}] <-- '{:?}'",
-            self.peer_addr, msg_o.session_id, msg_o.data
-        );
-        self.writer
-            .send((msg_o, self.peer_addr))
-            .await
-            .or(Err("Failed sending message =(".to_string()))?;
-        self.sent_bin.append(&mut data.as_bytes().to_vec());
-        self.max_server_pos += data.len();
-        Ok(())
+        for i in 0..RETRY_TIMES {
+            println!(
+                "[{} : {}] <-- (#{i}) '{:?}'",
+                self.peer_addr, msg_o.session_id, msg_o.data
+            );
+            self.writer
+                .send((msg_o.clone(), self.peer_addr))
+                .await
+                .or(Err("Failed sending message =(".to_string()))?;
+
+            let new_server_pos = self.max_server_pos + data.len();
+
+            let ddline = Instant::now() + Duration::from_secs(ACK_WAIT);
+
+            'att: loop {
+                if let Ok(omsg) = timeout(Duration::from_secs(ACK_WAIT), self.reader.recv()).await {
+                    if let Some(msg) = omsg {
+                        match msg.data {
+                            MessageData::Ack(n) if n == new_server_pos => {
+                                self.sent_bin.append(&mut data.as_bytes().to_vec());
+                                self.max_server_pos = new_server_pos;
+                                return Ok(());
+                            }
+                            _ => (),
+                        }
+                    }
+                } else {
+                    break 'att;
+                }
+
+                if Instant::now() > ddline {
+                    break 'att;
+                }
+            }
+        }
+        Err("Max retries exceeded".into())
     }
 }
 
@@ -344,13 +384,19 @@ async fn main() {
 
 async fn handle_session(mut session: LRCPSession) {
     println!("[{} : {}] connected", session.peer_addr, session.id);
+
     while let Ok(msg) = session.read_until('\n').await {
         println!(
             "[{} : {}] got line: '{}'",
             session.peer_addr, session.id, msg
         );
+
         let rev_msg = msg.chars().rev().collect::<String>();
-        session.write(&rev_msg).await.unwrap();
+        if let Err(e) = session.write(&rev_msg).await {
+            println!("[{} : {}] err on write: {e}", session.peer_addr, session.id);
+            break;
+        };
     }
+
     println!("[{} : {}] closed", session.peer_addr, session.id);
 }
