@@ -331,8 +331,8 @@ impl LRCPSession {
     }
 
     async fn write_chunk(&mut self, data: &str) -> Result<(), String> {
-        const RETRY_TIMES: u8 = 20;
-        const ACK_WAIT: u64 = 3;
+        const RETRY_TIMES: u8 = 60;
+        const ACK_WAIT: u64 = 1;
         let msg_o = Message {
             session_id: self.id,
             data: MessageData::Data(Payload {
