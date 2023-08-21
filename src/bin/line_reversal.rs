@@ -268,7 +268,8 @@ impl LRCPSession {
                     MessageData::Ack(n) if n < self.max_server_pos => {
                         Some(MessageData::Data(Payload {
                             pos: n,
-                            data: std::str::from_utf8(&self.sent_bin[n..])
+                            data: std::str::from_utf8(&self.sent_bin[n..]) // TODO: incorrect for
+                                // lange messages
                                 .unwrap()
                                 .to_string(),
                         }))
@@ -320,21 +321,32 @@ impl LRCPSession {
     }
 
     async fn write(&mut self, message: &str) -> Result<(), String> {
+        let message = format!("{}\n", message);
+        // NOTE: works only because only ASCII text allowed
+        for chunk in message.as_bytes().chunks(900) {
+            self.write_chunk(std::str::from_utf8(chunk).unwrap())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn write_chunk(&mut self, data: &str) -> Result<(), String> {
         const RETRY_TIMES: u8 = 20;
         const ACK_WAIT: u64 = 3;
-
-        let data = format!("{}\n", message);
         let msg_o = Message {
             session_id: self.id,
             data: MessageData::Data(Payload {
                 pos: self.max_server_pos,
-                data: data.clone(),
+                data: data.to_string().clone(),
             }),
         };
         for i in 0..RETRY_TIMES {
             println!(
-                "[{} : {}] <-- (#{i}) '{:?}'",
-                self.peer_addr, msg_o.session_id, msg_o.data
+                "{:?} - [{} : {}] <-- (#{i}) '{:?}'",
+                Instant::now(),
+                self.peer_addr,
+                msg_o.session_id,
+                msg_o.data
             );
             self.writer
                 .send((msg_o.clone(), self.peer_addr))
@@ -345,14 +357,47 @@ impl LRCPSession {
 
             let ddline = Instant::now() + Duration::from_secs(ACK_WAIT);
 
+            // TODO UGLY
+            // TODO: As practice showed, I should not lock on waiting for ack
             'att: loop {
                 if let Ok(omsg) = timeout(Duration::from_secs(ACK_WAIT), self.reader.recv()).await {
                     if let Some(msg) = omsg {
+                        println!(
+                            "{:?} - [{} : {}] --> '{:?}'",
+                            Instant::now(),
+                            self.peer_addr,
+                            msg.session_id,
+                            msg.data
+                        );
                         match msg.data {
                             MessageData::Ack(n) if n == new_server_pos => {
                                 self.sent_bin.append(&mut data.as_bytes().to_vec());
                                 self.max_server_pos = new_server_pos;
                                 return Ok(());
+                            }
+                            // TODO: should not be here
+                            MessageData::Data(p) => {
+                                if p.pos == self.max_client_pos {
+                                    self.max_client_pos += p.data.len();
+                                    self.last_sent_ack_n = self.max_client_pos;
+                                    self.recv_bin.append(&mut p.data.as_bytes().to_vec());
+                                }
+                                let data = MessageData::Ack(self.last_sent_ack_n);
+
+                                println!(
+                                    "[{} : {}] <-- '{:?}'",
+                                    self.peer_addr, msg.session_id, data
+                                );
+                                self.writer
+                                    .send((
+                                        Message {
+                                            session_id: self.id,
+                                            data,
+                                        },
+                                        self.peer_addr,
+                                    ))
+                                    .await
+                                    .or(Err("Failed sending message =(".to_string()))?;
                             }
                             _ => (),
                         }
