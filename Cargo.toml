@@ -41,6 +41,10 @@ path = "src/bin/speed_deamon.rs"
 name = "line_reversal"
 path = "src/bin/line_reversal.rs"
 
+[[bin]]
+name = "insecure_sockets_layer"
+path = "src/bin/insecure_sockets_layer.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
