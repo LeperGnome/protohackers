@@ -99,6 +99,7 @@ fn handle_connection(mut stream: TcpStream) {
             }
             Ok(n) => {
                 let orig = buf.clone();
+                println!("UNdecoded, unparsed: {:02X?}", &buf[..n]);
 
                 decode(&ops, &mut buf[..n], in_cnt);
                 if !validated && buf == orig {
@@ -106,6 +107,7 @@ fn handle_connection(mut stream: TcpStream) {
                     break;
                 }
                 validated = true;
+                println!("decoded, unparsed: {:02X?}", &buf[..n]);
 
                 in_cnt += n;
 
