@@ -72,6 +72,7 @@ fn main() {
 
 fn handle_connection(mut stream: TcpStream) {
     println!("New connection!");
+    let mut validated = false;
     let mut in_cnt: usize = 0;
     let mut out_cnt: usize = 0;
 
@@ -83,7 +84,7 @@ fn handle_connection(mut stream: TcpStream) {
     println!("Got ops: {:?}", ops);
 
     let mut data_line = String::new();
-    let mut buf = vec![];
+    let mut buf = [0; 6000];
     loop {
         match stream.read(&mut buf) {
             Err(e) => {
@@ -91,85 +92,62 @@ fn handle_connection(mut stream: TcpStream) {
                 break;
             }
             Ok(0) => {
-                println!("Got EOF, {:?}", buf);
+                println!("Got EOF");
                 break;
             }
             Ok(n) => {
+                let orig = buf.clone();
+
                 decode(&ops, &mut buf[..n], in_cnt);
+                if !validated && buf == orig {
+                    // Stoping noop
+                    break;
+                }
+                validated = true;
+
                 in_cnt += n;
 
-                let msg = std::str::from_utf8(&buf).unwrap();
+                let msg = std::str::from_utf8(&buf[..n]).unwrap();
                 println!("Got chunk: '{msg}'");
 
-                if let Some((l, r)) = msg.split_once('\n') {
-                    let out_msg = get_most_copies(&(data_line + l));
-                    println!("Responding with: '{out_msg}'");
+                data_line += msg;
 
-                    let mut resp = out_msg.as_bytes().to_owned();
-                    encode(&ops, &mut resp, out_cnt);
-                    out_cnt += resp.len();
+                if let Some((l, r)) = data_line.rsplit_once('\n'){
+                    for line in l.split('\n') {
+                        let out_msg = get_most_copies(line);
+                        println!("Responding with: '{out_msg}'");
 
-                    println!("Encoded response: {:#04X?}", resp);
-                    stream.write_all(&resp).unwrap();
-                    stream.flush().unwrap();
+                        let mut resp = out_msg.as_bytes().to_owned();
+                        encode(&ops, &mut resp, out_cnt);
 
-                    println!("Wrote response");
+                        stream.write_all(&resp).unwrap();
+                        stream.flush().unwrap();
 
+                        out_cnt += resp.len();
+                        println!("Wrote response");
+                    }
                     data_line = r.into();
-                } else {
-                    data_line += msg;
                 }
             }
         };
     }
-
-    // for line in br.lines() {
-    //     let mut data = line.unwrap().as_bytes().to_owned();
-    //     println!("Got data: {:?}", data);
-    //     let orig = data.clone();
-
-    //     decode(&ops, &mut data, in_cnt);
-
-    //     // stoppig, if cipher did non modify data
-    //     println!("{:?}\n{:?}\n{}", orig, data, orig == data);
-    //     if orig == data {
-    //         break;
-    //     }
-
-    //     in_cnt += data.len() as u32;
-
-    //     let msg = std::str::from_utf8(&data).unwrap();
-    //     println!("Data after cipher: {msg}");
-
-    //     let out_msg =  get_most_copies(msg);
-    //     println!("Responding with: '{msg}'");
-
-    //     let mut resp = out_msg.as_bytes().to_owned();
-    //     encode(&ops, &mut resp, out_cnt);
-    //     out_cnt += resp.len() as u32;
-
-    //     println!("Encoded response: {:#04X?}", resp);
-    //     stream.write_all(&resp).unwrap();
-    //     stream.flush().unwrap();
-
-    // }
     println!("Connection closed");
 }
 
 fn get_most_copies(msg: &str) -> String {
     let (res, _) = msg
         .split(',')
-        .map(|s| (s, s.split_once('x').unwrap().0.parse::<u32>().unwrap()))
+        .map(|s| (s, s.split_once('x').unwrap().0.parse::<usize>().unwrap()))
         .max_by_key(|(_, x)| *x)
         .unwrap();
 
-    return res.into();
+    return res.to_string() + "\n";
 }
 
 fn parse_ops(spec: &[u8], end: usize) -> Vec<Op> {
     let mut ops = vec![];
     let mut i = 0;
-    while i <= end {
+    while i < end {
         let op = spec[i];
         match op {
             X_REVESEBITS => ops.push(Op::Rev),
