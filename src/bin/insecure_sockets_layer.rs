@@ -4,6 +4,8 @@ use std::io::prelude::*;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
 
+use std::time::Instant;
+
 #[derive(Debug)]
 enum Op {
     Rev,
@@ -107,12 +109,13 @@ fn handle_connection(mut stream: TcpStream) {
 
                 in_cnt += n;
 
+                // NOTE: sometimes get a decoding error... idk why
                 let msg = std::str::from_utf8(&buf[..n]).unwrap();
                 println!("Got chunk: '{msg}'");
 
                 data_line += msg;
 
-                if let Some((l, r)) = data_line.rsplit_once('\n'){
+                if let Some((l, r)) = data_line.rsplit_once('\n') {
                     for line in l.split('\n') {
                         let out_msg = get_most_copies(line);
                         println!("Responding with: '{out_msg}'");
@@ -172,6 +175,7 @@ fn parse_ops(spec: &[u8], end: usize) -> Vec<Op> {
 }
 
 fn decode(ops: &Vec<Op>, data: &mut [u8], offset: usize) {
+    let now = Instant::now();
     for op in ops.iter().rev() {
         match *op {
             Op::Rev => revesebits(data),
@@ -181,9 +185,11 @@ fn decode(ops: &Vec<Op>, data: &mut [u8], offset: usize) {
             Op::Addpos => subpos(data, offset),
         }
     }
+    println!("Decodig time: {:?}", now.elapsed());
 }
 
 fn encode(ops: &Vec<Op>, data: &mut [u8], offset: usize) {
+    let now = Instant::now();
     for op in ops.iter() {
         match *op {
             Op::Rev => revesebits(data),
@@ -193,4 +199,5 @@ fn encode(ops: &Vec<Op>, data: &mut [u8], offset: usize) {
             Op::Addpos => addpos(data, offset),
         }
     }
+    println!("Encodig time: {:?}", now.elapsed());
 }
