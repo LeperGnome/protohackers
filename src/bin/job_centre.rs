@@ -74,7 +74,20 @@ impl JobCenter {
     async fn process_requests(&mut self) {
         while let Some(request) = self.request_rx.recv().await {
             println!("JobCenter got request: {:?}", request);
-            // TODO
+            match request.data {
+                RequestData::Get { queues, wait } => {
+                    todo!()
+                }
+                RequestData::Put { queue, job, pri } => {
+                    todo!()
+                }
+                RequestData::Abort { id } => {
+                    todo!()
+                }
+                RequestData::Delete { id } => {
+                    todo!()
+                }
+            };
         }
     }
 }
