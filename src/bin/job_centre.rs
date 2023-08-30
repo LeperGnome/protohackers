@@ -281,7 +281,6 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
             Ok(_) => {
                 if let Ok(request_data) = serde_json::from_str::<RequestData>(&line) {
                     let (response_tx, response_rx) = oneshot::channel::<Response>();
-                    let is_get = matches!(request_data, RequestData::Get { .. });
                     let request = Request {
                         data: request_data,
                         cid,
@@ -289,8 +288,10 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
                     };
                     request_tx.send(request).await.unwrap();
                     let response = response_rx.await.unwrap();
-                    if is_get {
-                        acquired_ids.push(response.id.unwrap()); // NOTE: hacky, but should work
+
+                    if response.job.is_some() {
+                        // NOTE: hacky, but should work
+                        acquired_ids.push(response.id.unwrap());
                     }
                     send_json(response, &mut writer).await;
                 } else {
