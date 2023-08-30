@@ -128,7 +128,7 @@ impl JobCenter {
             },
             RequestData::Put { queue, job, pri } => {
                 let response = self._put(queue, job, pri);
-                request.response_tx.send(response);
+                request.response_tx.send(response).unwrap();
                 self.next_id += 1;
             }
             RequestData::Abort { id } => {
@@ -180,27 +180,12 @@ impl JobCenter {
     }
 
     fn _get(&mut self, queues: &Vec<String>, wait: bool, cid: usize) -> Option<Response> {
-        let mut potential_jobs = vec![];
-
-        // TODO:
-        // check for locked job
-        // make it compile =)
-
-        // get top jobs from selected queues
-        for q_name in queues {
-            if let Some(q) = self.jobs.get(q_name) {
-                if let Some(j) = q.last() {
-                    potential_jobs.push(j);
-                }
-            }
-        }
+        let best_index_in_queue = self._get_best_index_queue(queues);
         let response: Option<Response>;
-        if let Some(best_job) = potential_jobs
-            .iter_mut()
-            .filter(|j| matches!(j.locked_by, None))
-            .max_by_key(|j| j.pri)
-        {
+        if let Some((i, q)) = best_index_in_queue {
             // job found -> responding and setting lock
+            let best_job = self.jobs.get_mut(&q).unwrap().get_mut(i).unwrap(); // Hacky, but I just
+                                                                               // found it above
             response = Some(Response {
                 status: ResponseStatus::Ok,
                 id: Some(best_job.id),
@@ -218,6 +203,34 @@ impl JobCenter {
             }
         }
         return response;
+    }
+
+    fn _get_best_index_queue(&self, queues: &Vec<String>) -> Option<(usize, String)> {
+        // NOTE: using this method to find location of a best job.
+        // All of that is used because I could not figure out how to use `get_many_mut()` on
+        // HashMap properly
+
+        let mut best_index_in_queue: Option<(usize, String)> = None;
+        let mut best_pri = 0_usize;
+
+        for q_name in queues {
+            if let Some(q) = self.jobs.get(q_name) {
+                // find best job in each queue
+                if let Some((i, j)) = q
+                    .iter()
+                    .filter(|j| matches!(j.locked_by, None))
+                    .enumerate()
+                    .max_by_key(|(_, j)| j.pri)
+                {
+                    // find overall best
+                    if j.pri > best_pri {
+                        best_index_in_queue = Some((i, q_name.clone()));
+                        best_pri = j.pri;
+                    }
+                }
+            }
+        }
+        return best_index_in_queue;
     }
 }
 
