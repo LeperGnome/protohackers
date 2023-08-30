@@ -6,6 +6,8 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+use std::collections::HashMap;
+
 // NOTE: might not be super accurate, since job can't actually be a list
 type JobData = Value;
 
@@ -65,30 +67,157 @@ impl Response {
             queue: None,
         };
     }
+    fn with_id(self, id: usize) -> Self {
+        return Self {
+            status: self.status,
+            id: Some(id),
+            job: self.job,
+            pri: self.pri,
+            queue: self.queue,
+        };
+    }
+}
+
+struct JobInfo {
+    id: usize,
+    data: JobData,
+    pri: usize,
+    locked_by: Option<usize>,
+    queue: String,
+}
+
+// NOTE: pessimized, but seems ok, considering expected load
+struct AwaitingClient {
+    cid: usize,
+    queues: Vec<String>,
+    response_tx: oneshot::Sender<Response>,
 }
 
 struct JobCenter {
+    next_id: usize,
+    jobs: HashMap<String, Vec<JobInfo>>,
+    awaiting_clients: Vec<AwaitingClient>,
     request_rx: mpsc::Receiver<Request>,
 }
 impl JobCenter {
+    fn new(request_rx: mpsc::Receiver<Request>) -> Self {
+        return Self {
+            next_id: 0,
+            jobs: HashMap::new(),
+            awaiting_clients: Vec::new(),
+            request_rx,
+        };
+    }
+
     async fn process_requests(&mut self) {
         while let Some(request) = self.request_rx.recv().await {
             println!("JobCenter got request: {:?}", request);
-            match request.data {
-                RequestData::Get { queues, wait } => {
-                    todo!()
-                }
-                RequestData::Put { queue, job, pri } => {
-                    todo!()
-                }
-                RequestData::Abort { id } => {
-                    todo!()
-                }
-                RequestData::Delete { id } => {
-                    todo!()
-                }
-            };
+            self._process_request(request).await;
         }
+    }
+
+    async fn _process_request(&mut self, request: Request) {
+        match request.data {
+            RequestData::Get { queues, wait } => match self._get(&queues, wait, request.cid) {
+                Some(r) => request.response_tx.send(r).unwrap(),
+                None => self.awaiting_clients.push(AwaitingClient {
+                    cid: request.cid,
+                    queues,
+                    response_tx: request.response_tx,
+                }),
+            },
+            RequestData::Put { queue, job, pri } => {
+                let response = self._put(queue, job, pri);
+                request.response_tx.send(response);
+                self.next_id += 1;
+            }
+            RequestData::Abort { id } => {
+                todo!()
+            }
+            RequestData::Delete { id } => {
+                todo!()
+            }
+        };
+    }
+
+    fn _put(&mut self, queue: String, job: JobData, pri: usize) -> Response {
+        let mut locked_by = None;
+
+        // check in awaiting_clients first
+        if let Some(i) = self
+            .awaiting_clients
+            .iter()
+            .position(|cli| cli.queues.contains(&queue))
+        {
+            let awaiting_client = self.awaiting_clients.remove(i);
+            let response = Response {
+                status: ResponseStatus::Ok,
+                id: Some(self.next_id),
+                job: Some(job.clone()),
+                pri: Some(pri),
+                queue: Some(queue.clone()),
+            };
+            awaiting_client.response_tx.send(response).unwrap();
+            locked_by = Some(awaiting_client.cid);
+        }
+
+        let new_job_info = JobInfo {
+            id: self.next_id,
+            data: job,
+            pri,
+            queue,
+            locked_by,
+        };
+
+        let jobs = self.jobs.entry(new_job_info.queue.clone()).or_default();
+
+        let insertion_idx = jobs
+            .binary_search_by_key(&new_job_info.pri, |j| j.pri)
+            .unwrap_or_else(|e| e);
+
+        jobs.insert(insertion_idx, new_job_info);
+        return Response::new_with_status(ResponseStatus::Ok).with_id(self.next_id);
+    }
+
+    fn _get(&mut self, queues: &Vec<String>, wait: bool, cid: usize) -> Option<Response> {
+        let mut potential_jobs = vec![];
+
+        // TODO:
+        // check for locked job
+        // make it compile =)
+
+        // get top jobs from selected queues
+        for q_name in queues {
+            if let Some(q) = self.jobs.get(q_name) {
+                if let Some(j) = q.last() {
+                    potential_jobs.push(j);
+                }
+            }
+        }
+        let response: Option<Response>;
+        if let Some(best_job) = potential_jobs
+            .iter_mut()
+            .filter(|j| matches!(j.locked_by, None))
+            .max_by_key(|j| j.pri)
+        {
+            // job found -> responding and setting lock
+            response = Some(Response {
+                status: ResponseStatus::Ok,
+                id: Some(best_job.id),
+                job: Some(best_job.data.clone()),
+                pri: Some(best_job.pri),
+                queue: Some(best_job.queue.clone()),
+            });
+            best_job.locked_by = Some(cid);
+        } else {
+            // no job found
+            if !wait {
+                response = Some(Response::new_with_status(ResponseStatus::NoJob));
+            } else {
+                response = None;
+            }
+        }
+        return response;
     }
 }
 
@@ -100,7 +229,7 @@ async fn main() {
     let (request_tx, request_rx) = mpsc::channel::<Request>(1024);
 
     tokio::spawn(async move {
-        let mut job_centre = JobCenter { request_rx };
+        let mut job_centre = JobCenter::new(request_rx);
         job_centre.process_requests().await;
     });
 
