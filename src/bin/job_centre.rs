@@ -95,6 +95,7 @@ struct AwaitingClient {
 
 struct JobCenter {
     next_id: usize,
+    job_locks: HashMap<usize, (String, usize)>,
     jobs: HashMap<String, Vec<JobInfo>>,
     awaiting_clients: Vec<AwaitingClient>,
     request_rx: mpsc::Receiver<Request>,
@@ -103,6 +104,7 @@ impl JobCenter {
     fn new(request_rx: mpsc::Receiver<Request>) -> Self {
         return Self {
             next_id: 0,
+            job_locks: HashMap::new(),
             jobs: HashMap::new(),
             awaiting_clients: Vec::new(),
             request_rx,
@@ -132,12 +134,31 @@ impl JobCenter {
                 self.next_id += 1;
             }
             RequestData::Abort { id } => {
-                todo!()
+                let response = self._abort(request.cid, id);
+                request.response_tx.send(response).unwrap();
             }
             RequestData::Delete { id } => {
                 todo!()
             }
         };
+    }
+
+    fn _abort(&mut self, request_cid: usize, id: usize) -> Response {
+        if let Some((queue, cid)) = self.job_locks.remove(&id) {
+            if cid != request_cid {
+                return Response::new_with_status(ResponseStatus::Error);
+            }
+            self.jobs
+                .get_mut(&queue)
+                .unwrap() // should be consistent
+                .iter_mut()
+                .find(|j| j.id == id)
+                .unwrap()
+                .locked_by = None;
+            return Response::new_with_status(ResponseStatus::Ok);
+        }
+
+        return Response::new_with_status(ResponseStatus::NoJob);
     }
 
     fn _put(&mut self, queue: String, job: JobData, pri: usize) -> Response {
@@ -159,6 +180,8 @@ impl JobCenter {
             };
             awaiting_client.response_tx.send(response).unwrap();
             locked_by = Some(awaiting_client.cid);
+            self.job_locks
+                .insert(self.next_id, (queue.clone(), awaiting_client.cid));
         }
 
         let new_job_info = JobInfo {
@@ -194,6 +217,8 @@ impl JobCenter {
                 queue: Some(best_job.queue.clone()),
             });
             best_job.locked_by = Some(cid);
+            self.job_locks
+                .insert(best_job.id, (best_job.queue.clone(), cid));
         } else {
             // no job found
             if !wait {
