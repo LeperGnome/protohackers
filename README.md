@@ -5,4 +5,6 @@ I highly recommend giving them a shot, I had a lot of fun solving them!
 See: https://protohackers.com/problems
 
 Compilation: cargo build --release --bin <task_name, e.g. 'job_centre'> 
+
+Warning: ugly code, keep women and children from screen
 ```
