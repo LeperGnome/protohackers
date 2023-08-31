@@ -7,16 +7,18 @@ use tokio::{
 };
 
 use std::collections::HashMap;
+use std::fmt::Debug;
 
 // NOTE: might not be super accurate, since job can't actually be a list
 type JobData = Value;
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
 #[serde(tag = "request")]
+#[serde(rename_all = "lowercase")]
 enum RequestData {
     Get {
         queues: Vec<String>,
+        #[serde(default)]
         wait: bool,
     },
     Put {
@@ -52,9 +54,13 @@ enum ResponseStatus {
 #[serde(rename_all = "kebab-case")]
 struct Response {
     status: ResponseStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     job: Option<JobData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pri: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     queue: Option<String>,
 }
 impl Response {
@@ -113,7 +119,6 @@ impl JobCenter {
 
     async fn process_requests(&mut self) {
         while let Some(request) = self.request_rx.recv().await {
-            println!("JobCenter got request: {:?}", request);
             self._process_request(request).await;
         }
     }
@@ -135,10 +140,18 @@ impl JobCenter {
             }
             RequestData::Abort { id } => {
                 let response = self._abort(request.cid, id);
-                request.response_tx.send(response).unwrap();
+                request.response_tx.send(response).unwrap_or(());
             }
             RequestData::Delete { id } => {
-                todo!()
+                let mut response = Response::new_with_status(ResponseStatus::NoJob);
+                for jobs in self.jobs.values_mut() {
+                    if let Some(idx) = jobs.iter().position(|j| j.id == id) {
+                        let removed_job = jobs.remove(idx);
+                        self.job_locks.remove(&removed_job.id);
+                        response = Response::new_with_status(ResponseStatus::Ok);
+                    }
+                }
+                request.response_tx.send(response).unwrap_or(());
             }
         };
     }
@@ -146,18 +159,42 @@ impl JobCenter {
     fn _abort(&mut self, request_cid: usize, id: usize) -> Response {
         if let Some((queue, cid)) = self.job_locks.remove(&id) {
             if cid != request_cid {
+                // TODO: dont remove in the first place
+                self.job_locks.insert(id, (queue, cid));
                 return Response::new_with_status(ResponseStatus::Error);
             }
-            self.jobs
+            let job = self
+                .jobs
                 .get_mut(&queue)
                 .unwrap() // should be consistent
                 .iter_mut()
                 .find(|j| j.id == id)
-                .unwrap()
-                .locked_by = None;
+                .unwrap();
+
+            // send released job to awaiting clinet if any
+            if let Some(i) = self
+                .awaiting_clients
+                .iter()
+                .position(|cli| cli.queues.contains(&queue))
+            {
+                let awaiting_client = self.awaiting_clients.remove(i);
+                let response = Response {
+                    status: ResponseStatus::Ok,
+                    id: Some(job.id),
+                    job: Some(job.data.clone()),
+                    pri: Some(job.pri),
+                    queue: Some(queue.clone()),
+                };
+                self.job_locks
+                    .insert(job.id, (queue.clone(), awaiting_client.cid));
+                awaiting_client.response_tx.send(response).unwrap();
+                job.locked_by = Some(request_cid);
+            } else {
+                // remove the lock othewise
+                job.locked_by = None;
+            }
             return Response::new_with_status(ResponseStatus::Ok);
         }
-
         return Response::new_with_status(ResponseStatus::NoJob);
     }
 
@@ -304,28 +341,33 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
                 break;
             }
             Ok(_) => {
-                if let Ok(request_data) = serde_json::from_str::<RequestData>(&line) {
-                    let (response_tx, response_rx) = oneshot::channel::<Response>();
-                    let request = Request {
-                        data: request_data,
-                        cid,
-                        response_tx,
-                    };
-                    request_tx.send(request).await.unwrap();
-                    let response = response_rx.await.unwrap();
+                println!("req ---> {}", line.trim());
+                match serde_json::from_str::<RequestData>(line.trim()) {
+                    Ok(request_data) => {
+                        let (response_tx, response_rx) = oneshot::channel::<Response>();
+                        let request = Request {
+                            data: request_data,
+                            cid,
+                            response_tx,
+                        };
+                        request_tx.send(request).await.unwrap();
+                        let response = response_rx.await.unwrap();
 
-                    if response.job.is_some() {
-                        // NOTE: hacky, but should work
-                        acquired_ids.push(response.id.unwrap());
+                        if response.job.is_some() {
+                            // NOTE: hacky, but should work
+                            acquired_ids.push(response.id.unwrap());
+                        }
+                        send_json(response, &mut writer).await;
                     }
-                    send_json(response, &mut writer).await;
-                } else {
-                    // Client sent invalid message, responding with error, keeping connection
-                    send_json(
-                        Response::new_with_status(ResponseStatus::Error),
-                        &mut writer,
-                    )
-                    .await;
+                    Err(e) => {
+                        // Client sent invalid message, responding with error, keeping connection
+                        eprintln!("Could not parse line: {e}");
+                        send_json(
+                            Response::new_with_status(ResponseStatus::Error),
+                            &mut writer,
+                        )
+                        .await;
+                    }
                 }
             }
         };
@@ -335,12 +377,12 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
 
 async fn send_json<T, W>(data: T, writer: &mut W)
 where
-    T: Serialize,
+    T: Serialize + Debug,
     W: AsyncWriteExt + Send + Unpin + 'static,
 {
-    writer
-        .write_all(serde_json::to_string(&data).unwrap().as_bytes())
-        .await
-        .unwrap();
+    let msg = serde_json::to_string(&data).unwrap() + "\n";
+    println!("res <--- {}", msg.trim());
+
+    writer.write_all(msg.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 }
