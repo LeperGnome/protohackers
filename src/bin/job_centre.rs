@@ -215,10 +215,10 @@ impl JobCenter {
                 pri: Some(pri),
                 queue: Some(queue.clone()),
             };
-            awaiting_client.response_tx.send(response).unwrap();
             locked_by = Some(awaiting_client.cid);
             self.job_locks
                 .insert(self.next_id, (queue.clone(), awaiting_client.cid));
+            awaiting_client.response_tx.send(response).unwrap();
         }
 
         let new_job_info = JobInfo {
@@ -318,6 +318,7 @@ async fn main() {
 }
 
 async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Sender<Request>) {
+    println!("{cid} connected");
     let (reader, mut writer) = split(stream);
     let mut br = BufReader::new(reader);
     let mut line = String::new();
@@ -328,6 +329,7 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
             Ok(0) | Err(_) => {
                 // EOF or some error: should abort all acquired jobs and close the connection
                 for id in acquired_ids {
+                    println!("{cid} abortin {id} on disconnect");
                     let (response_tx, _) = oneshot::channel::<Response>();
                     request_tx
                         .send(Request {
@@ -341,7 +343,7 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
                 break;
             }
             Ok(_) => {
-                println!("req ---> {}", line.trim());
+                println!("{cid} ---> {}", line.trim());
                 match serde_json::from_str::<RequestData>(line.trim()) {
                     Ok(request_data) => {
                         let (response_tx, response_rx) = oneshot::channel::<Response>();
@@ -357,7 +359,7 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
                             // NOTE: hacky, but should work
                             acquired_ids.push(response.id.unwrap());
                         }
-                        send_json(response, &mut writer).await;
+                        send_json(response, &mut writer, cid).await;
                     }
                     Err(e) => {
                         // Client sent invalid message, responding with error, keeping connection
@@ -365,6 +367,7 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
                         send_json(
                             Response::new_with_status(ResponseStatus::Error),
                             &mut writer,
+                            cid,
                         )
                         .await;
                     }
@@ -373,15 +376,16 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
         };
         line.clear();
     }
+    println!("{cid} disconnected");
 }
 
-async fn send_json<T, W>(data: T, writer: &mut W)
+async fn send_json<T, W>(data: T, writer: &mut W, cid: usize)
 where
     T: Serialize + Debug,
     W: AsyncWriteExt + Send + Unpin + 'static,
 {
     let msg = serde_json::to_string(&data).unwrap() + "\n";
-    println!("res <--- {}", msg.trim());
+    println!("{cid} <--- {}", msg.trim());
 
     writer.write_all(msg.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
