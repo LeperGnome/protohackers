@@ -149,6 +149,7 @@ impl JobCenter {
                         let removed_job = jobs.remove(idx);
                         self.job_locks.remove(&removed_job.id);
                         response = Response::new_with_status(ResponseStatus::Ok);
+                        break;
                     }
                 }
                 request.response_tx.send(response).unwrap_or(());
@@ -187,8 +188,8 @@ impl JobCenter {
                 };
                 self.job_locks
                     .insert(job.id, (queue.clone(), awaiting_client.cid));
-                awaiting_client.response_tx.send(response).unwrap();
                 job.locked_by = Some(request_cid);
+                awaiting_client.response_tx.send(response).unwrap();
             } else {
                 // remove the lock othewise
                 job.locked_by = None;
@@ -280,9 +281,9 @@ impl JobCenter {
                 // find best job in each queue
                 if let Some((i, j)) = q
                     .iter()
-                    .filter(|j| matches!(j.locked_by, None))
                     .enumerate()
-                    .max_by_key(|(_, j)| j.pri)
+                    .filter(|(_, j)| matches!(j.locked_by, None))
+                    .last()
                 {
                     // find overall best
                     if j.pri > best_pri {
@@ -329,7 +330,7 @@ async fn handle_connection(stream: TcpStream, cid: usize, request_tx: mpsc::Send
             Ok(0) | Err(_) => {
                 // EOF or some error: should abort all acquired jobs and close the connection
                 for id in acquired_ids {
-                    println!("{cid} abortin {id} on disconnect");
+                    println!("{cid} <> aborting {id} on disconnect");
                     let (response_tx, _) = oneshot::channel::<Response>();
                     request_tx
                         .send(Request {
