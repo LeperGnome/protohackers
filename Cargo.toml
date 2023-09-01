@@ -49,6 +49,10 @@ path = "src/bin/insecure_sockets_layer.rs"
 name = "job_centre"
 path = "src/bin/job_centre.rs"
 
+[[bin]]
+name = "vcs"
+path = "src/bin/vcs.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
