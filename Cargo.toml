@@ -53,6 +53,10 @@ path = "src/bin/job_centre.rs"
 name = "vcs"
 path = "src/bin/vcs.rs"
 
+[[bin]]
+name = "vcs_client"
+path = "src/bin/vcs_client.rs"
+
 [dependencies]
 serde_json = "1.0.103"
 serde = { version = "1.0.174", features = ["derive"] }
